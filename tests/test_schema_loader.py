@@ -1,6 +1,10 @@
 """
 Unit tests for graph/schema_loader.py — dynamic OpenAI tool schema builder.
 """
+from __future__ import annotations
+
+from typing import Any, Optional
+
 import pytest
 
 from graph.schema_loader import build_tool_from_schema, _resolve_range, _class_to_json_schema
@@ -59,7 +63,7 @@ class TestEnumExpansion:
     def tool(self):
         return build_tool_from_schema(SCHEMA_PATH)
 
-    def _find_issue_type(self, props):
+    def _find_issue_type(self, props: dict[str, Any]) -> Optional[dict[str, Any]]:
         """Recursively search for 'issue_type' in nested properties."""
         for key, val in props.items():
             if key == "issue_type":
@@ -88,7 +92,7 @@ class TestEnumExpansion:
     def test_tool_type_is_enum_string(self, tool):
         props = tool["function"]["parameters"]["properties"]
 
-        def find(p, target):
+        def find(p: dict[str, Any], target: str) -> Optional[dict[str, Any]]:
             for k, v in p.items():
                 if k == target:
                     return v
@@ -114,7 +118,7 @@ class TestSkipFields:
     def tool(self):
         return build_tool_from_schema(SCHEMA_PATH)
 
-    def _all_property_keys(self, obj):
+    def _all_property_keys(self, obj: Any) -> set[str]:
         """Collect every property key name in the entire schema recursively."""
         keys = set()
         if not isinstance(obj, dict):
@@ -203,7 +207,7 @@ class TestCircularReference:
 # ---------------------------------------------------------------------------
 
 class TestResolveRange:
-    def _call(self, range_type: str, classes=None, enums=None):
+    def _call(self, range_type: str, classes: Optional[dict[str, Any]] = None, enums: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         return _resolve_range(
             range_type,
             classes or {},

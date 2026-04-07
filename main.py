@@ -19,7 +19,7 @@ DOCS_PATH = "docs/流程数据.txt"
 # Build phase
 # ---------------------------------------------------------------------------
 
-def build():
+def build() -> bool:
     from graph.extractor import extract_and_build
     from graph.storage import GraphStore
 
@@ -63,7 +63,7 @@ DEMO_QUERIES = [
 ]
 
 
-def query_loop():
+def query_loop() -> None:
     from graph.retriever import KnowledgeGraphRetriever
 
     if not Path(GRAPH_PATH).exists():
@@ -83,7 +83,7 @@ def query_loop():
         print(f"\n答案:\n{answer}\n{'=' * 60}\n")
 
 
-def demo():
+def demo() -> None:
     from graph.retriever import KnowledgeGraphRetriever
 
     if not Path(GRAPH_PATH).exists():

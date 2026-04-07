@@ -17,12 +17,13 @@ import json
 import os
 import re
 import uuid
-from typing import Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 from typing_extensions import TypedDict
 
@@ -224,12 +225,12 @@ def _extract_via_plain_text(
 # Extraction node — tries all three strategies in order
 # ---------------------------------------------------------------------------
 
-def extract_sops_node(state: ExtractionState) -> dict:
+def extract_sops_node(state: ExtractionState) -> dict[str, Any]:
     errors = list(state.get("errors", []))
     retry = state.get("retry_count", 0)
     llm = _create_llm()
 
-    strategies = [
+    strategies: list[tuple[str, Callable[[ChatOpenAI, str], tuple[Optional[ExtractionOutput], str]]]] = [
         ("function_calling", _extract_via_tool_calling),
         ("json_mode",        _extract_via_json_mode),
         ("plain_text",       _extract_via_plain_text),
@@ -260,7 +261,7 @@ def _unique_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
-def build_graph_node(state: ExtractionState) -> dict:
+def build_graph_node(state: ExtractionState) -> dict[str, Any]:
     errors = list(state.get("errors", []))
     output: Optional[ExtractionOutput] = state.get("extracted_output")
 
@@ -272,10 +273,10 @@ def build_graph_node(state: ExtractionState) -> dict:
     edges: list[GraphEdge] = []
     tool_registry: dict[str, str] = {}  # tool_name → node_id
 
-    def add_node(nid: str, ntype: str, data: dict) -> None:
+    def add_node(nid: str, ntype: str, data: dict[str, Any]) -> None:
         nodes.append(GraphNode(id=nid, node_type=ntype, data=data))
 
-    def add_edge(src: str, tgt: str, etype: str, meta: dict | None = None) -> None:
+    def add_edge(src: str, tgt: str, etype: str, meta: dict[str, Any] | None = None) -> None:
         edges.append(GraphEdge(source=src, target=tgt, edge_type=etype, metadata=meta or {}))
 
     def ensure_tool(tool: ExtractedTool) -> str:
@@ -350,7 +351,7 @@ def build_graph_node(state: ExtractionState) -> dict:
 # Save graph node
 # ---------------------------------------------------------------------------
 
-def save_graph_node(state: ExtractionState) -> dict:
+def save_graph_node(state: ExtractionState) -> dict[str, Any]:
     errors = list(state.get("errors", []))
     kg: Optional[KnowledgeGraph] = state.get("graph")
     if kg is None:
@@ -382,7 +383,7 @@ def should_retry(state: ExtractionState) -> str:
 # Build and compile the extraction graph
 # ---------------------------------------------------------------------------
 
-def build_extraction_graph():
+def build_extraction_graph() -> CompiledStateGraph:
     builder = StateGraph(ExtractionState)
     builder.add_node("extract_sops", extract_sops_node)
     builder.add_node("build_graph", build_graph_node)

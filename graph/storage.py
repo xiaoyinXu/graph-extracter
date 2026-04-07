@@ -17,7 +17,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import networkx as nx
 from dotenv import load_dotenv
@@ -195,7 +195,7 @@ class GraphStore:
 
     def similarity_search(
         self, query: str, k: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """
         Return top-k semantically similar nodes.
 
@@ -215,14 +215,14 @@ class GraphStore:
             })
         return hits
 
-    def get_node(self, node_id: str) -> Optional[dict]:
+    def get_node(self, node_id: str) -> Optional[dict[str, Any]]:
         """Return node data dict (includes node_type)."""
         node = self.node_map.get(node_id)
         if node is None:
             return None
         return {"id": node.id, "node_type": node.node_type, **node.data}
 
-    def get_ancestors(self, node_id: str) -> list[dict]:
+    def get_ancestors(self, node_id: str) -> list[dict[str, Any]]:
         """Walk edges in reverse to collect [SOP → Step → Rule] chain."""
         ancestors = []
         current = node_id
@@ -241,7 +241,7 @@ class GraphStore:
             current = parent
         return ancestors
 
-    def get_sop_context(self, sop_id: str) -> dict:
+    def get_sop_context(self, sop_id: str) -> dict[str, Any]:
         """
         Return the full SOP tree sorted by step_index / rule_index.
 
@@ -326,7 +326,7 @@ class GraphStore:
         reachable.add(node_id)
         return self.nx_graph.subgraph(reachable).copy()
 
-    def get_rule_context(self, node_id: str, node_type: str) -> dict:
+    def get_rule_context(self, node_id: str, node_type: str) -> dict[str, Any]:
         """
         Return focused context for a specific rule or sub-rule node.
         Includes the node itself + its parent chain + siblings at same level.

@@ -1,6 +1,8 @@
 """
 Unit tests for graph/models.py — Pydantic extraction models.
 """
+from __future__ import annotations
+
 import pytest
 from pydantic import ValidationError
 

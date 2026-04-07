@@ -4,7 +4,7 @@ Utility functions for the graph package.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import networkx as nx
 
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from graph.models import GraphNode
 
 
-def print_graph_topology(compiled_graph, name: str = "Graph") -> None:
+def print_graph_topology(compiled_graph: Any, name: str = "Graph") -> None:
     """
     Print the topology of a compiled LangGraph graph.
 

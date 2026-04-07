@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
 
 from graph.storage import GraphStore
@@ -126,13 +127,13 @@ def _format_rule_context(ctx: dict) -> str:
 # Retrieval graph nodes
 # ---------------------------------------------------------------------------
 
-def search_nodes_node(state: RetrievalState, *, store: GraphStore) -> dict:
+def search_nodes_node(state: RetrievalState, *, store: GraphStore) -> dict[str, Any]:
     """Vector search → top-k node hits with score."""
     hits = store.similarity_search(state["query"], k=8)
     return {"matched_hits": hits}
 
 
-def expand_context_node(state: RetrievalState, *, store: GraphStore) -> dict:
+def expand_context_node(state: RetrievalState, *, store: GraphStore) -> dict[str, Any]:
     """
     Expand each hit to its context.
 
@@ -205,7 +206,7 @@ _ANSWER_SYSTEM = """\
 """
 
 
-def generate_answer_node(state: RetrievalState) -> dict:
+def generate_answer_node(state: RetrievalState) -> dict[str, Any]:
     """Use LLM to synthesize answer from retrieved context."""
     context = state.get("formatted_context", "")
     if not context or context == "未找到相关知识图谱内容。":
@@ -225,7 +226,7 @@ def generate_answer_node(state: RetrievalState) -> dict:
 # Build and compile the retrieval graph
 # ---------------------------------------------------------------------------
 
-def build_retrieval_graph(store: GraphStore):
+def build_retrieval_graph(store: GraphStore) -> CompiledStateGraph:
     """Build LangGraph retrieval pipeline bound to a GraphStore instance."""
     from functools import partial
 

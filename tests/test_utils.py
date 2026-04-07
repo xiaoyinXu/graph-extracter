@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import pytest
 from io import StringIO
+from typing import Any
 from unittest.mock import patch
 
 from graph.extractor import build_extraction_graph
 from graph.utils import print_graph_topology
 
 
-def capture_topology(compiled_graph, name: str) -> str:
+def capture_topology(compiled_graph: Any, name: str) -> str:
     """Helper: return print_graph_topology output as a string."""
     buf = StringIO()
     with patch("builtins.print", side_effect=lambda *args, **kwargs: buf.write(" ".join(str(a) for a in args) + "\n")):

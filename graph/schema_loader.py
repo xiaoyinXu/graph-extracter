@@ -18,14 +18,14 @@ LinkML → JSON Schema mappings
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
 # -----------------------------------------------------------------------
 # LinkML built-in / imported type aliases → JSON Schema primitives
 # -----------------------------------------------------------------------
-_LINKML_TYPES: dict[str, dict] = {
+_LINKML_TYPES: dict[str, dict[str, Any]] = {
     "string":     {"type": "string"},
     "str":        {"type": "string"},
     "integer":    {"type": "integer"},
@@ -62,14 +62,14 @@ _DEFAULT_SKIP_FIELDS: frozenset[str] = frozenset({
 
 def _resolve_range(
     range_type: str,
-    classes: dict,
-    enums: dict,
+    classes: dict[str, Any],
+    enums: dict[str, Any],
     default_range: str,
     visiting: frozenset[str],
     skip_fields: frozenset[str],
     max_depth: int,
     depth: int,
-) -> dict:
+) -> dict[str, Any]:
     if not range_type:
         range_type = default_range
 
@@ -105,18 +105,18 @@ def _resolve_range(
 
 def _class_to_json_schema(
     class_name: str,
-    classes: dict,
-    enums: dict,
+    classes: dict[str, Any],
+    enums: dict[str, Any],
     default_range: str,
     visiting: frozenset[str],
     skip_fields: frozenset[str],
     max_depth: int,
     depth: int,
-) -> dict:
-    class_def = classes.get(class_name) or {}
-    attributes: dict = class_def.get("attributes") or {}
+) -> dict[str, Any]:
+    class_def: dict[str, Any] = classes.get(class_name) or {}
+    attributes: dict[str, Any] = class_def.get("attributes") or {}
 
-    properties: dict[str, dict] = {}
+    properties: dict[str, dict[str, Any]] = {}
     required_fields: list[str] = []
 
     # Prevent re-entering this class (cycle guard for children)
@@ -133,7 +133,7 @@ def _class_to_json_schema(
         is_required: bool = bool(attr_def.get("required", False))
         is_identifier: bool = bool(attr_def.get("identifier", False))
         description: str = _clean_text(attr_def.get("description") or "")
-        minimum_value = attr_def.get("minimum_value")
+        minimum_value: Optional[int | float] = attr_def.get("minimum_value")
 
         # Resolve range to JSON Schema
         prop = _resolve_range(
@@ -162,7 +162,7 @@ def _class_to_json_schema(
         if is_required or is_identifier:
             required_fields.append(attr_name)
 
-    schema: dict = {"type": "object", "properties": properties}
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required_fields:
         schema["required"] = required_fields
 
@@ -190,7 +190,7 @@ def build_tool_from_schema(
     skip_fields: Optional[set[str]] = None,
     max_depth: int = 5,
     list_field_name: str = "sops",
-) -> dict:
+) -> dict[str, Any]:
     """
     Load a LinkML YAML schema and build an OpenAI function/tool definition.
 
@@ -211,8 +211,8 @@ def build_tool_from_schema(
     with open(schema_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    classes: dict = raw.get("classes") or {}
-    enums: dict = raw.get("enums") or {}
+    classes: dict[str, Any] = raw.get("classes") or {}
+    enums: dict[str, Any] = raw.get("enums") or {}
     default_range: str = raw.get("default_range") or "string"
     schema_name: str = raw.get("name") or "schema"
     schema_desc: str = _clean_text(raw.get("description") or "")
