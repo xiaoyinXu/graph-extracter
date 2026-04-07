@@ -313,6 +313,19 @@ class GraphStore:
 
         return result
 
+    def get_connected_subgraph(self, node_id: str) -> nx.DiGraph:
+        """
+        Return a copy of the induced subgraph containing node_id and all nodes
+        reachable from it by following directed edges.
+
+        Returns an empty DiGraph when node_id is not in the graph.
+        """
+        if node_id not in self.nx_graph:
+            return nx.DiGraph()
+        reachable = nx.descendants(self.nx_graph, node_id)
+        reachable.add(node_id)
+        return self.nx_graph.subgraph(reachable).copy()
+
     def get_rule_context(self, node_id: str, node_type: str) -> dict:
         """
         Return focused context for a specific rule or sub-rule node.
