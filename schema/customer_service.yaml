@@ -1,0 +1,473 @@
+id: http://my-company.com/customer_service
+name: customer_service
+description: >
+  客服域语义模型（L1 领域层）。
+  核心关注点是"流程数据"：SOP 以多步骤（Step）→ 规则（Rule）→ 条件分支（SubRule）→ 工具调用（Tool）
+  的层次结构建模，完整保留决策流程的语义，而非将流程降级为纯文本字段。
+
+imports:
+  - linkml:types
+
+prefixes:
+  cs:     http://my-company.com/customer_service/
+  linkml: https://w3id.org/linkml/
+
+default_prefix: cs
+default_range: string
+
+# =============================================================================
+# Concept 层（枚举）
+# =============================================================================
+enums:
+
+  IssueType:
+    description: >
+      问题类型枚举。新增场景在此追加枚举值，不新增 YAML 文件。
+    permissible_values:
+      SHIPPING_QUERY:      { description: "寄件查询（如何下单、寄件流程）" }
+      BILLING:             { description: "计费问题（计费重量、运费计算）" }
+      TRACKING:            { description: "物流追踪（查快递、查运单状态）" }
+      DELIVERY_URGE:       { description: "催派送（要求加急派送）" }
+      STUDENT_DISCOUNT:    { description: "学生优惠（学生认证、5折寄件）" }
+      COMPLAINT:           { description: "投诉（丢件、损件、服务态度）" }
+      ORDER_PLACING:       { description: "下单问题" }
+      REFUND:              { description: "退款/赔偿申请" }
+      OTHER:               { description: "其他未分类问题" }
+      # --- 终端找货 PoC 场景 ---
+      HANDOVER_GAP:        { description: "交接无下文找货（封车→解封车后无后续轨迹）" }
+      STATION_STAY_GAP:    { description: "站内无下文找货（收件后无妥投，站内滞留）" }
+      POST_DELIVERY_LOSS:  { description: "妥投后找货（妥投记录存在但客户反馈未收）" }
+
+  AcceptanceResult:
+    description: 用户对当前话术/方案的接受结果（流程推进的条件）
+    permissible_values:
+      ACCEPTED:    { description: "用户接受，流程终止" }
+      REJECTED:    { description: "用户不接受，升级到下一步" }
+      FOLLOWUP:    { description: "用户有追问，进入分支处理" }
+
+  ToolType:
+    description: SOP 中使用的内部系统工具类型
+    permissible_values:
+      TICKET:      { description: "工单系统（如：工单新）" }
+      GROUP_CHAT:  { description: "拉群协调（如：与站点负责人拉群）" }
+      QUERY:       { description: "查询系统（查路由、查配送员信息）" }
+      NOTIFY:      { description: "通知系统（发短信、回拨）" }
+      ESCALATE:    { description: "升级系统（升级为投诉、特急工单）" }
+
+  # ---------------------------------------------------------------------------
+  # 终端找货 PoC 新增枚举
+  # ---------------------------------------------------------------------------
+
+  EventTypeEnum:
+    description: >
+      物流轨迹事件类型，用于 TriggerCondition 匹配。
+      对应 MCP 工具返回的 last_event_type 字段。
+    permissible_values:
+      UnsealEvent:          { description: "解封车（运输交接环节，封车后解封）" }
+      CourierReceiveEvent:  { description: "快递员揽收/收件（末端站点接收包裹）" }
+      DeliveryEvent:        { description: "妥投/签收（派件完成）" }
+      ScanInEvent:          { description: "到件扫描（包裹到达站点）" }
+
+  SearchScene:
+    description: >
+      终端找货场景分类。TriggerCondition 命中后用于上下文标注，
+      辅助 Agent 在 SOP 执行中理解当前所处场景。
+    permissible_values:
+      HANDOVER_GAP:       { description: "交接无下文（封车→解封车后超时无后续轨迹）" }
+      STATION_STAY_GAP:   { description: "站内无下文（快递员收件后超时无妥投记录）" }
+      POST_DELIVERY_LOSS: { description: "妥投后找货（妥投记录存在但客户反馈未收到）" }
+      ITEM_MISSING:       { description: "妥投少件（包裹内件数与订单不符）" }
+
+  PriorityLevel:
+    description: >
+      找货优先级，由包裹价值和时效共同决定。
+      Agent 据此调整找货紧迫度和升级路径。
+    permissible_values:
+      CRITICAL: { description: "紧急（高价值件 ≥500元 或 时效类商品）" }
+      NORMAL:   { description: "正常处理" }
+      LOW:      { description: "低优（低价值且非时效）" }
+      UNKNOWN:  { description: "未知（待 MCP 获取定价后更新）" }
+
+  ReviewStatusEnum:
+    description: TriggerCondition 人工审核状态，控制是否参与自动路由
+    permissible_values:
+      APPROVED:           { description: "已审核通过，confidence≥0.80 时自动路由" }
+      PENDING_REVIEW:     { description: "待人工审核，暂不参与自动路由" }
+      MINED_UNSTRUCTURED: { description: "LLM fallback 产出，待结构化审核" }
+
+# =============================================================================
+# Entity 层
+# =============================================================================
+classes:
+
+  # ---------------------------------------------------------------------------
+  # IssueCategory：问题类型实体（L1 域内分类节点）
+  # 兼容保留 IssueType 枚举，同时为后续图关系挂载提供实体节点
+  # ---------------------------------------------------------------------------
+  IssueCategory:
+    description: 问题类型实体（L1 域内分类节点，替代 IssueType 枚举）
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        description: 类型名称（如：DELIVERY_URGE）
+      label:
+        range: string
+        required: false
+        description: 中文标签（如：催派送）
+      description:
+        range: string
+        required: false
+      related_sops:
+        range: SOP
+        multivalued: true
+        description: 该类型下的所有 SOP
+
+  # ---------------------------------------------------------------------------
+  # ValueChain：价值链（L0 顶层锚点）
+  # ---------------------------------------------------------------------------
+  ValueChain:
+    description: >-
+      L0 价值链层，代表顶层业务价值域（如售后服务、履约交付）。
+      一个 ValueChain 下挂载多个 ProcessDomain。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+      description:
+        range: string
+        required: false
+      domains:
+        range: ProcessDomain
+        multivalued: true
+        inlined: false
+        description: 该价值链下的所有流程域
+
+  # ---------------------------------------------------------------------------
+  # ProcessDomain：流程域（L1 显式层）
+  # ---------------------------------------------------------------------------
+  ProcessDomain:
+    description: 流程域（L1 层），对应一个业务大类（如：客服域、售后域）
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        description: 域名称（如：customer_service）
+      description:
+        range: string
+        required: false
+      value_chain:
+        range: ValueChain
+        required: false
+        description: 所属价值链（L0）
+      categories:
+        range: IssueCategory
+        multivalued: true
+        description: 域下的所有问题类型
+      sops:
+        range: SOP
+        multivalued: true
+        description: 域下直接挂载的所有 SOP
+
+  # ===========================================================================
+  # 流程模型：SOP → SOPStep → SOPRule → SOPSubRule → Tool
+  # 对应 Excel 数据：sop方案列（多步骤文本） + mermaid_code列（决策图）
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Tool：SOP 执行中调用的内部系统工具
+  # 来源：SOP 文本中的【工单新】【查路由】等标记
+  #
+  # 双重角色：
+  #   知识层（图中）：记录"这步需要用什么工具"的语义知识
+  #   执行层桥梁：通过 mcp_endpoint 连接到 skills/ 中的实际 MCP 实现
+  # ---------------------------------------------------------------------------
+  Tool:
+    description: >
+      客服系统内部工具。Agent 执行 SOP 时需要调用的具体系统动作。
+      例如：【工单新】对应创建催派工单；拉群对应内部 IM 群操作。
+      同时作为知识层与 MCP 执行层的桥梁，通过 mcp_endpoint 绑定实际 skill 实现。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        description: 工具名称（如：工单新、查路由、拉群）
+      tool_type:
+        range: ToolType
+        required: true
+      description:
+        range: string
+        required: false
+        description: 工具的功能说明及使用时机
+      # --- 执行层桥梁字段（连接 skills/ MCP 实现）---
+      mcp_endpoint:
+        range: string
+        required: false
+        description: >
+          对应 OpenClaw skill 的调用端点（如 skills/jdl-mcp-waybill-trace-openclaw）。
+          为空时 Agent 按 name 字段做模糊匹配；填写后实现精确绑定。
+      input_schema:
+        range: string
+        required: false
+        description: >
+          工具入参的 JSON Schema 字符串。Agent 据此填充参数，避免幻觉。
+          示例：'{"waybill_no": {"type": "string", "description": "运单号"}}'
+      health_status:
+        range: string
+        required: false
+        description: >
+          工具当前可用状态：ACTIVE / DEGRADED / OFFLINE。
+          由 MCP Registry 健康探针写入，Agent 路由时跳过非 ACTIVE 工具。
+
+  # ---------------------------------------------------------------------------
+  # SOPSubRule：规则内的追问分支（条件 → 执行思路 + 参考话术）
+  # 来源：SOP 文本中 "如果用户追问XXX" 的结构
+  # 对应 mermaid 中：SubDecision → Reply 节点
+  # ---------------------------------------------------------------------------
+  SOPSubRule:
+    description: >
+      SOP 规则内的追问分支。当主规则话术执行后用户有追问时，
+      根据追问条件进入对应的子分支，给出更具体的执行思路和话术。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      condition:
+        range: string
+        required: true
+        description: 触发此分支的追问条件（如：如果用户追问配送路线停滞）
+      execution_approach:
+        range: string
+        required: true
+        description: 执行思路（告诉客服"怎么做"）
+      reference_script:
+        range: string
+        required: false
+        description: 参考话术（告诉客服"说什么"，含【变量占位符】）
+
+  # ---------------------------------------------------------------------------
+  # SOPRule：SOP 步骤内的一条规则（条件 → 动作）
+  # 来源：SOP 文本中 "规则1/规则2/..." 的结构
+  # 对应 mermaid 中：Decision → Rule → SubDecision 节点链
+  # ---------------------------------------------------------------------------
+  SOPRule:
+    description: >
+      SOP 步骤内的一条规则，由触发条件、执行思路、参考话术三部分构成。
+      包含用户追问时的子分支（SOPSubRule）。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      rule_index:
+        range: integer
+        minimum_value: 1
+        required: true
+        description: 规则在步骤内的顺序编号（规则1、规则2...）
+      condition:
+        range: string
+        required: true
+        description: >
+          触发此规则的用户意图描述
+          （如：诉求是求助&咨询&了解现状，询问包裹到哪里了）
+      execution_approach:
+        range: string
+        required: true
+        description: 执行思路（逻辑层：告诉客服应该怎么处理）
+      reference_script:
+        range: string
+        required: false
+        description: >
+          参考话术（表达层：告诉客服说什么，含【变量占位符】如
+          【最新路由实际操作站点名称】【应回复时间】）
+      # === Relations ===
+      sub_rules:
+        range: SOPSubRule
+        multivalued: true
+        description: 该规则下的追问分支列表
+      used_tools:
+        range: Tool
+        multivalued: true
+        description: 执行此规则时需要调用的内部工具（如：工单新）
+
+  # ---------------------------------------------------------------------------
+  # SOPStep：SOP 中的一个执行步骤（第一步、第二步、第三步）
+  # 来源：SOP 文本中 "- 第N步" 的结构
+  # 对应 mermaid 中：Step1 → Decision → ... → CheckAccept{用户接受话术?} 节点组
+  # ---------------------------------------------------------------------------
+  SOPStep:
+    description: >
+      SOP 中的一个升级步骤。多步骤按顺序推进：
+      当用户不接受当前步骤的话术时（CheckAccept → 不认可），升级到下一步。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      step_index:
+        range: integer
+        minimum_value: 1
+        required: true
+        description: 步骤顺序编号（1=第一步，2=第二步，3=第三步）
+      goal:
+        range: string
+        required: true
+        description: 本步骤的处理目标（对应"目标："字段）
+      acceptance_check:
+        range: string
+        required: false
+        description: >
+          用户接受检验点描述（对应 mermaid 中 CheckAccept 节点）。
+          通常为：用户接受 → 结束；用户不接受 → 进入下一步
+      # === Relations ===
+      rules:
+        range: SOPRule
+        multivalued: true
+        description: 本步骤下的规则列表
+      next_step:
+        range: SOPStep
+        required: false
+        description: 用户不接受当前步骤时升级到的下一步（可为空表示最终步骤）
+
+  # ---------------------------------------------------------------------------
+  # SOP：标准作业流程（知识平台核心资产）
+  # 对应 Excel 列：细分场景 + sop方案 + mermaid_code + 客户原声
+  # ---------------------------------------------------------------------------
+  SOP:
+    description: >
+      标准作业流程（Standard Operating Procedure）。
+      以多步骤决策树结构建模，完整保留条件分支、话术和工具调用语义。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        description: SOP 名称（如：未到站-常规催派送）
+      issue_type:
+        range: IssueType
+        required: true
+        description: 适用的问题类型（用于 Agent 意图路由）
+      category:
+        range: IssueCategory
+        required: false
+        description: 指向 IssueCategory 实体节点
+      domain:
+        range: ProcessDomain
+        required: false
+        description: 所属流程域
+      sub_scenario:
+        range: string
+        required: false
+        description: >
+          细分场景名称，比 IssueType 更细粒度的分类。
+          对应 Excel "细分场景"列（如：未到站-常规催派送、已到站-未分配小哥收件人催派送）
+      trigger_samples:
+        range: string
+        multivalued: true
+        description: >
+          触发此 SOP 的客户原声样本（对应 Excel "客户原声"列）。
+          用于向量检索时的意图匹配。
+      mermaid_code:
+        range: string
+        required: false
+        description: >
+          Mermaid 格式的决策流程图（对应 Excel "mermaid_code"列）。
+          保留完整流程可视化表示，供人工审核和 Agent 流程理解使用。
+      version:
+        range: string
+        required: false
+        description: 版本号（如：v1.0）
+      source_doc:
+        range: string
+        required: false
+        description: 来源文档路径或 URL
+      quality_score:
+        range: float
+        required: false
+        description: >
+          SOP 质量置信度 0~1，反映"解法"本身的可靠性。
+          由专家评审打分和历史执行成功率共同决定；< 0.75 时路由结果附带人工复核警告。
+      success_rate:
+        range: float
+        required: false
+        description: >
+          历史执行成功率（whether_found=true 的比例），由线上找货反馈统计计算。
+          初始为 null，积累足够样本后自动更新；用于在线校准 quality_score。
+      # === Relations ===
+      steps:
+        range: SOPStep
+        multivalued: true
+        description: SOP 的步骤列表（有序，step_index 决定执行顺序）
+
+  # ---------------------------------------------------------------------------
+  # TriggerCondition：事件→SOP 路由规则节点（终端找货 PoC 核心）
+  #
+  # 替代 Agent Prompt 中的 if-else 场景判断。
+  # Agent 拿到最新轨迹事件后，匹配图谱中的 TriggerCondition：
+  #   - match_confidence ≥ 0.80 且 review_status = APPROVED → 第一阶段通过：场景识别可靠
+  #   - sop.quality_score ≥ 0.75 → 第二阶段通过：解法可靠，确定性路由
+  #   - match_confidence ≥ 0.80 但 sop.quality_score < 0.75 → 路由但附带人工复核警告
+  #   - match_confidence < 0.80 → 第一阶段失败，LLM fallback，记录为 MINED_UNSTRUCTURED
+  # ---------------------------------------------------------------------------
+  TriggerCondition:
+    description: >
+      事件→SOP 路由规则节点。
+      每个节点代表一个「当 X 事件发生且满足 Y 条件时，激活 Z SOP」的确定性规则。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      match_event_type:
+        range: EventTypeEnum
+        required: true
+        description: 需匹配的末端轨迹事件类型（如 UnsealEvent）
+      match_search_scene:
+        range: SearchScene
+        required: false
+        description: 对应的找货场景分类，辅助 Agent 理解上下文
+      match_next_event_null:
+        range: boolean
+        required: false
+        description: true = 该事件后无后续轨迹（无下文场景）
+      match_delay_hours_gt:
+        range: integer
+        required: false
+        description: 超时阈值（小时），当前事件距今超过此值才触发（如 24）
+      match_issue_type:
+        range: IssueType
+        required: false
+        description: 关联工单类型（如 COMPLAINT，用于妥投异常场景）
+      priority:
+        range: integer
+        required: false
+        description: 规则优先级（1 最高），多条规则命中时按优先级选取
+      confidence:
+        range: float
+        required: false
+        description: 规则置信度 0~1（已废弃，由 match_confidence 替代；保留以兼容旧数据）
+      match_confidence:
+        range: float
+        required: false
+        description: >
+          匹配置信度 0~1，反映"信号→场景识别"的可靠性，独立于 SOP 质量。
+          ≥ 0.80 才进入确定性路由；由历史信号精度（Precision）离线标定，随找货反馈在线更新。
+      review_status:
+        range: ReviewStatusEnum
+        required: false
+        description: 人工审核状态（PoC 阶段手动标注 APPROVED）
+      activates_sop:
+        range: SOP
+        required: true
+        description: 命中此条件后激活的 SOP
