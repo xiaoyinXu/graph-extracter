@@ -17,6 +17,7 @@ LinkML → JSON Schema mappings
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -260,3 +261,151 @@ def get_enum_values(schema_path: str, enum_name: str) -> list[str]:
         raw = yaml.safe_load(f)
     enums = raw.get("enums") or {}
     return list((enums.get(enum_name) or {}).get("permissible_values", {}).keys())
+
+
+# -----------------------------------------------------------------------
+# Field spec: structured representation of one LinkML attribute
+# -----------------------------------------------------------------------
+
+@dataclass
+class FieldSpec:
+    name: str
+    required: bool           # required: true OR identifier: true
+    range: str               # "string", "integer", "float", "boolean", or class/enum name
+    multivalued: bool
+    enum_values: list[str]   # non-empty only when range is an enum name
+    description: str
+    indexed: bool = False    # x_index: true → include field text in vector index
+    min_index_chars: int = 0 # x_index_min_chars → skip short values (e.g. noise filter)
+
+
+def get_class_field_specs(schema_path: str, class_name: str) -> list[FieldSpec]:
+    """Return field specs for every attribute of *class_name* in the schema.
+
+    Parameters
+    ----------
+    schema_path : path to the LinkML YAML file
+    class_name  : class name to inspect (e.g. "SOP", "SOPStep", "SOPRule")
+
+    Returns
+    -------
+    list[FieldSpec] — one entry per attribute defined for the class
+    """
+    with open(schema_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    classes: dict[str, Any] = raw.get("classes") or {}
+    enums: dict[str, Any] = raw.get("enums") or {}
+    default_range: str = raw.get("default_range") or "string"
+
+    class_def: dict[str, Any] = classes.get(class_name) or {}
+    attributes: dict[str, Any] = class_def.get("attributes") or {}
+
+    specs: list[FieldSpec] = []
+    for attr_name, attr_def in attributes.items():
+        if attr_def is None:
+            attr_def = {}
+        range_name: str = attr_def.get("range") or default_range
+        is_required: bool = bool(attr_def.get("required") or attr_def.get("identifier"))
+        multivalued: bool = bool(attr_def.get("multivalued", False))
+        description: str = _clean_text(attr_def.get("description") or "")
+        enum_values: list[str] = (
+            list((enums[range_name].get("permissible_values") or {}).keys())
+            if range_name in enums else []
+        )
+        indexed: bool = bool(attr_def.get("x_index", False))
+        min_index_chars: int = int(attr_def.get("x_index_min_chars", 0))
+        specs.append(FieldSpec(
+            name=attr_name,
+            required=is_required,
+            range=range_name,
+            multivalued=multivalued,
+            enum_values=enum_values,
+            description=description,
+            indexed=indexed,
+            min_index_chars=min_index_chars,
+        ))
+
+    return specs
+
+
+# -----------------------------------------------------------------------
+# Relation spec: inter-class relationships derived from schema
+# -----------------------------------------------------------------------
+
+@dataclass
+class RelationSpec:
+    """Describes a relation attribute whose range is another class (not a primitive/enum)."""
+    field_name: str      # YAML attribute name, e.g. "steps"
+    target_class: str    # range class name, e.g. "SOPStep"
+    multivalued: bool    # True = list relation, False = single reference
+    edge_type: str       # derived edge type string, e.g. "HAS_STEP"
+
+
+def field_to_edge_type(field_name: str) -> str:
+    """Derive an edge type from a LinkML relation attribute name.
+
+    Convention (matches existing graph.json edge types):
+      used_<plural>  →  USES_<SINGULAR>   e.g. ``used_tools``  → ``USES_TOOL``
+      <plural>s      →  HAS_<SINGULAR>    e.g. ``steps``       → ``HAS_STEP``
+                                               ``sub_rules``    → ``HAS_SUB_RULE``
+      <singular>     →  <UPPER>           e.g. ``next_step``   → ``NEXT_STEP``
+    """
+    if field_name.startswith("used_"):
+        rest = field_name[5:]           # "tools"
+        singular = rest.rstrip("s")     # "tool"
+        return f"USES_{singular.upper()}"
+    if field_name.endswith("s"):
+        singular = field_name.rstrip("s")  # "step", "rule", "sub_rule"
+        return f"HAS_{singular.upper()}"
+    return field_name.upper()           # "NEXT_STEP", "CATEGORY", …
+
+
+def get_relation_specs(schema_path: str, class_name: str) -> list[RelationSpec]:
+    """Return all relation fields for *class_name* (range is a class, not a primitive/enum).
+
+    Parameters
+    ----------
+    schema_path : path to the LinkML YAML file
+    class_name  : class to inspect
+
+    Returns
+    -------
+    list[RelationSpec] — one entry per relation attribute (ordered as in YAML)
+    """
+    with open(schema_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    classes: dict[str, Any] = raw.get("classes") or {}
+    enums: dict[str, Any] = raw.get("enums") or {}
+    default_range: str = raw.get("default_range") or "string"
+
+    class_def: dict[str, Any] = classes.get(class_name) or {}
+    attributes: dict[str, Any] = class_def.get("attributes") or {}
+
+    specs: list[RelationSpec] = []
+    for attr_name, attr_def in attributes.items():
+        if attr_def is None:
+            attr_def = {}
+        range_name: str = attr_def.get("range") or default_range
+        # Skip primitives and enums — only class references are relations
+        if range_name.lower() in _LINKML_TYPES or range_name in enums:
+            continue
+        if range_name not in classes:
+            continue
+        multivalued: bool = bool(attr_def.get("multivalued", False))
+        specs.append(RelationSpec(
+            field_name=attr_name,
+            target_class=range_name,
+            multivalued=multivalued,
+            edge_type=field_to_edge_type(attr_name),
+        ))
+
+    return specs
+
+
+def get_all_class_names(schema_path: str) -> list[str]:
+    """Return all class names defined in the schema."""
+    with open(schema_path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    return list((raw.get("classes") or {}).keys())

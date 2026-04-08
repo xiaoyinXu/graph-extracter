@@ -247,6 +247,7 @@ classes:
       condition:
         range: string
         required: true
+        x_index: true
         description: 触发此分支的追问条件（如：如果用户追问配送路线停滞）
       execution_approach:
         range: string
@@ -278,6 +279,7 @@ classes:
       condition:
         range: string
         required: true
+        x_index: true
         description: >
           触发此规则的用户意图描述
           （如：诉求是求助&咨询&了解现状，询问包裹到哪里了）
@@ -288,6 +290,7 @@ classes:
       reference_script:
         range: string
         required: false
+        x_index: true
         description: >
           参考话术（表达层：告诉客服说什么，含【变量占位符】如
           【最新路由实际操作站点名称】【应回复时间】）
@@ -322,6 +325,7 @@ classes:
       goal:
         range: string
         required: true
+        x_index: true
         description: 本步骤的处理目标（对应"目标："字段）
       acceptance_check:
         range: string
@@ -354,6 +358,7 @@ classes:
       name:
         range: string
         required: true
+        x_index: true
         description: SOP 名称（如：未到站-常规催派送）
       issue_type:
         range: IssueType
@@ -370,12 +375,14 @@ classes:
       sub_scenario:
         range: string
         required: false
+        x_index: true
         description: >
           细分场景名称，比 IssueType 更细粒度的分类。
           对应 Excel "细分场景"列（如：未到站-常规催派送、已到站-未分配小哥收件人催派送）
       trigger_samples:
         range: string
         multivalued: true
+        x_index: true
         description: >
           触发此 SOP 的客户原声样本（对应 Excel "客户原声"列）。
           用于向量检索时的意图匹配。

@@ -1,40 +1,40 @@
 """
 Pydantic extraction models mirroring the customer_service.yaml LinkML schema.
 Used as structured output targets for LLM-based knowledge graph extraction.
+
+Enumerations are generated dynamically from the schema YAML so that adding
+or renaming enum values in customer_service.yaml is automatically reflected
+here without touching this file.
 """
 from __future__ import annotations
 
+import os
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from graph.schema_loader import get_enum_values
+
+_SCHEMA_PATH = str(Path(__file__).resolve().parent.parent / "schema" / "customer_service.yaml")
+SCHEMA_PATH: str = os.getenv("SCHEMA_PATH", _SCHEMA_PATH)
+
 
 # ---------------------------------------------------------------------------
-# Enumerations (from schema/customer_service.yaml)
+# Enumerations — generated dynamically from schema/customer_service.yaml
 # ---------------------------------------------------------------------------
 
-class IssueType(str, Enum):
-    SHIPPING_QUERY = "SHIPPING_QUERY"
-    BILLING = "BILLING"
-    TRACKING = "TRACKING"
-    DELIVERY_URGE = "DELIVERY_URGE"
-    STUDENT_DISCOUNT = "STUDENT_DISCOUNT"
-    COMPLAINT = "COMPLAINT"
-    ORDER_PLACING = "ORDER_PLACING"
-    REFUND = "REFUND"
-    OTHER = "OTHER"
-    HANDOVER_GAP = "HANDOVER_GAP"
-    STATION_STAY_GAP = "STATION_STAY_GAP"
-    POST_DELIVERY_LOSS = "POST_DELIVERY_LOSS"
+def _make_str_enum(name: str, schema_path: str) -> type:
+    """Build a str-Enum type from a LinkML enum defined in *schema_path*."""
+    values = get_enum_values(schema_path, name)
+    if not values:
+        raise ValueError(f"Enum '{name}' not found or empty in {schema_path}")
+    return Enum(name, {v: v for v in values}, type=str)  # type: ignore[return-value]
 
 
-class ToolType(str, Enum):
-    TICKET = "TICKET"
-    GROUP_CHAT = "GROUP_CHAT"
-    QUERY = "QUERY"
-    NOTIFY = "NOTIFY"
-    ESCALATE = "ESCALATE"
+IssueType = _make_str_enum("IssueType", SCHEMA_PATH)
+ToolType = _make_str_enum("ToolType", SCHEMA_PATH)
 
 
 # ---------------------------------------------------------------------------

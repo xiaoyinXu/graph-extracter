@@ -2,12 +2,13 @@
 Unit tests for graph/storage.py — GraphStore (no real API calls).
 
 All tests use FakeEmbeddings from conftest.py, patched into graph.storage
-so that _build_vector_index() never calls OpenAI.
+so that _build_vector_index() never calls OpenAI or Elasticsearch.
 """
 from __future__ import annotations
 
 import pytest
 from unittest.mock import patch
+from langchain_core.vectorstores import InMemoryVectorStore
 
 from graph.models import GraphEdge, GraphNode, KnowledgeGraph
 from graph.storage import GraphStore
@@ -19,8 +20,12 @@ from tests.conftest import FakeEmbeddings
 # ---------------------------------------------------------------------------
 
 def make_store(kg: KnowledgeGraph) -> GraphStore:
-    """Build a GraphStore from a KnowledgeGraph, bypassing real embeddings."""
-    with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()):
+    """Build a GraphStore without real embeddings or Elasticsearch."""
+    def fake_vs(docs, emb):
+        return InMemoryVectorStore.from_documents(docs, emb) if docs else InMemoryVectorStore(emb)
+
+    with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()), \
+         patch("graph.storage._create_vector_store", side_effect=fake_vs):
         return GraphStore.from_kg(kg)
 
 
@@ -236,7 +241,12 @@ class TestSimilaritySearch:
 class TestSaveLoad:
     def test_roundtrip(self, minimal_kg, tmp_path):
         path = str(tmp_path / "test_graph.json")
-        with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()):
+
+        def fake_vs(docs, emb):
+            return InMemoryVectorStore.from_documents(docs, emb) if docs else InMemoryVectorStore(emb)
+
+        with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()), \
+             patch("graph.storage._create_vector_store", side_effect=fake_vs):
             store = GraphStore.from_kg(minimal_kg)
             store.save(path)
             loaded = GraphStore.load(path)

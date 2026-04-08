@@ -1,15 +1,22 @@
 """
-Unit tests for graph/extractor.py — build_graph_node, should_retry.
+Unit tests for graph/extractor.py — build_graph_node, should_retry,
+validate_graph_node, should_retry_after_validation.
 
 LLM-dependent nodes (extract_sops_node) are tested via mocking;
-pure logic nodes (build_graph_node, should_retry) are tested directly.
+pure logic nodes (build_graph_node, should_retry, validate_graph_node)
+are tested directly.
 """
 from __future__ import annotations
 
 import pytest
 
-from graph.extractor import build_graph_node, should_retry
-from graph.models import ExtractionOutput, KnowledgeGraph
+from graph.extractor import (
+    build_graph_node,
+    should_retry,
+    should_retry_after_validation,
+    validate_graph_node,
+)
+from graph.models import ExtractionOutput, GraphEdge, GraphNode, KnowledgeGraph
 
 
 # ---------------------------------------------------------------------------
@@ -196,3 +203,248 @@ class TestBuildGraphNodePreservesErrors:
         }
         result = build_graph_node(state)
         assert "prior_error" in result["errors"]
+
+
+# ---------------------------------------------------------------------------
+# Helpers for validation tests
+# ---------------------------------------------------------------------------
+
+def _base_state(kg: KnowledgeGraph, retry_count: int = 0) -> dict:
+    return {
+        "raw_text": "", "extracted_output": None,
+        "graph": kg, "errors": [], "retry_count": retry_count,
+        "validation_issues": [],
+    }
+
+
+def _make_sop_node(**overrides) -> GraphNode:
+    data = {
+        "name": "催派送SOP",
+        "issue_type": "DELIVERY_URGE",
+        "sub_scenario": "未到站-常规催派送",
+        "trigger_samples": ["怎么还没到"],
+    }
+    data.update(overrides)
+    return GraphNode(id="sop1", node_type="SOP", data=data)
+
+
+def _make_step_node(**overrides) -> GraphNode:
+    data = {"step_index": 1, "goal": "安抚用户", "sop_id": "sop1"}
+    data.update(overrides)
+    return GraphNode(id="step1", node_type="SOPStep", data=data)
+
+
+def _make_rule_node(**overrides) -> GraphNode:
+    data = {
+        "rule_index": 1,
+        "condition": "用户询问时间",
+        "execution_approach": "查询路由后告知",
+        "sop_id": "sop1",
+    }
+    data.update(overrides)
+    return GraphNode(id="rule1", node_type="SOPRule", data=data)
+
+
+def _make_tool_node(**overrides) -> GraphNode:
+    data = {"name": "查路由", "tool_type": "QUERY"}
+    data.update(overrides)
+    return GraphNode(id="tool1", node_type="Tool", data=data)
+
+
+def _issues(result: dict, severity: str | None = None) -> list:
+    issues = result["validation_issues"]
+    if severity:
+        return [i for i in issues if i["severity"] == severity]
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# validate_graph_node — basic structure
+# ---------------------------------------------------------------------------
+
+class TestValidateGraphNodeBasic:
+    def test_returns_validation_issues_key(self):
+        kg = KnowledgeGraph(nodes=[_make_sop_node()], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        assert "validation_issues" in result
+
+    def test_valid_kg_has_no_errors(self, minimal_kg):
+        result = validate_graph_node(_base_state(minimal_kg))
+        assert _issues(result, "ERROR") == []
+
+    def test_none_graph_adds_error_message(self):
+        state = _base_state(KnowledgeGraph())
+        state["graph"] = None
+        result = validate_graph_node(state)
+        assert any("no graph" in e for e in result["errors"])
+
+    def test_empty_kg_passes(self):
+        result = validate_graph_node(_base_state(KnowledgeGraph()))
+        assert _issues(result, "ERROR") == []
+
+
+# ---------------------------------------------------------------------------
+# validate_graph_node — required field checks
+# ---------------------------------------------------------------------------
+
+class TestValidateRequiredFields:
+    def test_missing_sop_name_is_error(self):
+        node = _make_sop_node(name=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "name" and i["node_id"] == "sop1" for i in errors)
+
+    def test_empty_sop_name_is_error(self):
+        node = _make_sop_node(name="   ")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "name" for i in errors)
+
+    def test_missing_step_goal_is_error(self):
+        node = _make_step_node(goal=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "goal" for i in errors)
+
+    def test_missing_rule_condition_is_error(self):
+        node = _make_rule_node(condition=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "condition" for i in errors)
+
+    def test_missing_rule_execution_approach_is_error(self):
+        node = _make_rule_node(execution_approach=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "execution_approach" for i in errors)
+
+    def test_missing_tool_name_is_error(self):
+        node = _make_tool_node(name=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "name" for i in errors)
+
+    def test_optional_field_none_is_not_error(self):
+        """reference_script is optional — None value should not be an error."""
+        node = _make_rule_node(reference_script=None)
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert not any(i["field"] == "reference_script" for i in errors)
+
+
+# ---------------------------------------------------------------------------
+# validate_graph_node — enum checks
+# ---------------------------------------------------------------------------
+
+class TestValidateEnumFields:
+    def test_valid_issue_type_passes(self):
+        node = _make_sop_node(issue_type="DELIVERY_URGE")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        assert not any(i["field"] == "issue_type" for i in _issues(result, "ERROR"))
+
+    def test_invalid_issue_type_is_error(self):
+        node = _make_sop_node(issue_type="INVALID_TYPE")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "issue_type" for i in errors)
+
+    def test_invalid_tool_type_is_error(self):
+        node = _make_tool_node(tool_type="MAGIC")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "tool_type" for i in errors)
+
+    def test_valid_tool_type_passes(self):
+        node = _make_tool_node(tool_type="QUERY")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        assert not any(i["field"] == "tool_type" for i in _issues(result, "ERROR"))
+
+
+# ---------------------------------------------------------------------------
+# validate_graph_node — structural checks
+# ---------------------------------------------------------------------------
+
+class TestValidateStructural:
+    def test_duplicate_node_ids_is_error(self):
+        nodes = [_make_sop_node(), _make_sop_node()]  # same id "sop1"
+        kg = KnowledgeGraph(nodes=nodes, edges=[])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "id" and "uplicate" in i["message"] for i in errors)
+
+    def test_edge_missing_source_is_error(self):
+        node = _make_sop_node()
+        edge = GraphEdge(source="ghost", target="sop1", edge_type="HAS_STEP", metadata={})
+        kg = KnowledgeGraph(nodes=[node], edges=[edge])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "source" for i in errors)
+
+    def test_edge_missing_target_is_error(self):
+        node = _make_sop_node()
+        edge = GraphEdge(source="sop1", target="ghost", edge_type="HAS_STEP", metadata={})
+        kg = KnowledgeGraph(nodes=[node], edges=[edge])
+        result = validate_graph_node(_base_state(kg))
+        errors = _issues(result, "ERROR")
+        assert any(i["field"] == "target" for i in errors)
+
+    def test_valid_edge_passes(self):
+        sop = _make_sop_node()
+        step = _make_step_node()
+        edge = GraphEdge(source="sop1", target="step1", edge_type="HAS_STEP", metadata={})
+        kg = KnowledgeGraph(nodes=[sop, step], edges=[edge])
+        result = validate_graph_node(_base_state(kg))
+        assert not any(i["field"] in ("source", "target") for i in _issues(result, "ERROR"))
+
+
+# ---------------------------------------------------------------------------
+# validate_graph_node — optional field warnings
+# ---------------------------------------------------------------------------
+
+class TestValidateWarnings:
+    def test_optional_empty_string_is_warning(self):
+        """acceptance_check is optional; empty string → WARNING."""
+        node = _make_step_node(acceptance_check="")
+        kg = KnowledgeGraph(nodes=[node], edges=[])
+        result = validate_graph_node(_base_state(kg))
+        warnings = _issues(result, "WARNING")
+        assert any(i["field"] == "acceptance_check" for i in warnings)
+
+
+# ---------------------------------------------------------------------------
+# should_retry_after_validation
+# ---------------------------------------------------------------------------
+
+class TestShouldRetryAfterValidation:
+    def _state(self, issues: list, retry_count: int = 0) -> dict:
+        return {"validation_issues": issues, "retry_count": retry_count, "errors": []}
+
+    def test_no_issues_goes_to_save(self):
+        assert should_retry_after_validation(self._state([])) == "save_graph"
+
+    def test_warnings_only_goes_to_save(self):
+        issues = [{"severity": "WARNING", "field": "x", "node_id": "n", "node_type": "SOP", "message": "w"}]
+        assert should_retry_after_validation(self._state(issues)) == "save_graph"
+
+    def test_error_low_retry_retries(self):
+        issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]
+        assert should_retry_after_validation(self._state(issues, retry_count=0)) == "extract_sops"
+
+    def test_error_retry_count_2_still_retries(self):
+        issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]
+        assert should_retry_after_validation(self._state(issues, retry_count=2)) == "extract_sops"
+
+    def test_error_retry_count_3_goes_to_save(self):
+        issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]
+        assert should_retry_after_validation(self._state(issues, retry_count=3)) == "save_graph"

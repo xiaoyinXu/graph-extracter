@@ -22,10 +22,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
 
-from graph.storage import GraphStore
+from graph.storage import GraphStore, SubgraphResult
+from graph.schema_loader import get_class_field_specs
 from graph.utils import print_graph_topology
 
 load_dotenv()
+
+SCHEMA_PATH = os.getenv("SCHEMA_PATH", "schema/customer_service.yaml")
+ROOT_CLASS = os.getenv("ROOT_CLASS", "SOP")
 
 # ---------------------------------------------------------------------------
 # LangGraph state
@@ -91,7 +95,7 @@ def _format_sop_context(ctx: dict) -> str:
 
 
 def _format_rule_context(ctx: dict) -> str:
-    """Render focused rule/sub-rule context."""
+    """Render focused rule/sub-rule context using schema-indexed fields."""
     lines = []
     node = ctx.get("node", {})
     ntype = node.get("node_type", "")
@@ -104,21 +108,44 @@ def _format_rule_context(ctx: dict) -> str:
         )
         lines.append(f"路径: {breadcrumb}")
 
-    if ntype == "SOPRule":
-        lines.append(f"\n规则{node.get('rule_index', '')}: {node.get('condition', '')}")
-        lines.append(f"执行思路: {node.get('execution_approach', '')}")
-        if node.get("reference_script"):
-            lines.append(f"参考话术: {node['reference_script']}")
-        for sub in ctx.get("children", []):
-            lines.append(f"  ↳ 追问[{sub['condition']}]")
-            lines.append(f"     执行思路: {sub['execution_approach']}")
-            if sub.get("reference_script"):
-                lines.append(f"     参考话术: {sub['reference_script']}")
-    elif ntype == "SOPSubRule":
-        lines.append(f"\n追问分支: {node.get('condition', '')}")
-        lines.append(f"执行思路: {node.get('execution_approach', '')}")
-        if node.get("reference_script"):
-            lines.append(f"参考话术: {node['reference_script']}")
+    # Render indexed text fields from schema (avoids hardcoding class names)
+    if ntype:
+        try:
+            field_specs = get_class_field_specs(SCHEMA_PATH, ntype)
+            for spec in field_specs:
+                if not spec.indexed:
+                    continue
+                val = node.get(spec.name)
+                if not val:
+                    continue
+                label = spec.description.split("：")[0] if spec.description else spec.name
+                if isinstance(val, list):
+                    for item in val:
+                        lines.append(f"  {label}: {item}")
+                else:
+                    lines.append(f"  {label}: {val}")
+        except Exception:
+            pass
+
+    for child in ctx.get("children", []):
+        child_ntype = child.get("node_type", "")
+        if child_ntype:
+            try:
+                child_specs = get_class_field_specs(SCHEMA_PATH, child_ntype)
+                for spec in child_specs:
+                    if not spec.indexed:
+                        continue
+                    val = child.get(spec.name)
+                    if not val:
+                        continue
+                    label = spec.description.split("：")[0] if spec.description else spec.name
+                    if isinstance(val, list):
+                        for item in val:
+                            lines.append(f"    ↳ {label}: {item}")
+                    else:
+                        lines.append(f"    ↳ {label}: {val}")
+            except Exception:
+                pass
 
     return "\n".join(lines)
 
@@ -160,8 +187,8 @@ def expand_context_node(state: RetrievalState, *, store: GraphStore) -> dict[str
         score = hit["score"]
 
         # SOP-level hit or high-confidence match → full SOP context
-        if node_type == "SOP" or score >= 0.85:
-            target_sop_id = node_id if node_type == "SOP" else sop_id
+        if node_type == ROOT_CLASS or score >= 0.85:
+            target_sop_id = node_id if node_type == ROOT_CLASS else sop_id
             if target_sop_id and target_sop_id not in seen_sop_ids:
                 seen_sop_ids.add(target_sop_id)
                 ctx = store.get_sop_context(target_sop_id)
@@ -276,6 +303,35 @@ class KnowledgeGraphRetriever:
             print(f"\n[retriever] context:\n{final_state.get('formatted_context', '')[:500]}...\n")
         return final_state.get("answer", "")
 
-    def search(self, query: str, k: int = 5) -> list[dict]:
+    def search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
         """Raw vector search without answer generation."""
         return self.store.similarity_search(query, k=k)
+
+    def search_subgraph(
+        self,
+        query: str,
+        k: int = 3,
+        traverse_from_root: bool = False,
+    ) -> SubgraphResult:
+        """
+        Vector-search for nodes matching *query*, traverse their connected
+        subgraphs, and return a merged result including a Mermaid diagram.
+
+        Parameters
+        ----------
+        query : str
+            Natural-language text to search for.
+        k : int
+            Number of top vector-search document hits to consider (default 3).
+        traverse_from_root : bool
+            If ``True``, resolve the root SOP via ``sop_id`` and return the
+            full SOP context.  If ``False`` (default), traverse only from the
+            matched node downward for a focused result.
+
+        Returns
+        -------
+        SubgraphResult with fields: hits, start_node_ids, subgraph, mermaid
+        """
+        return self.store.search_and_traverse(
+            query, k=k, traverse_from_root=traverse_from_root
+        )

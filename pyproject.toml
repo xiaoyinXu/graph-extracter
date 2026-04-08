@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "elasticsearch>=8.19.3",
+    "fastapi>=0.135.3",
     "langchain>=1.2.15",
+    "langchain-elasticsearch>=1.0.0",
     "langchain-openai>=1.1.12",
     "langgraph>=1.1.6",
     "networkx>=3.6.1",
@@ -12,6 +15,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "uvicorn[standard]>=0.44.0",
 ]
 
 [dependency-groups]

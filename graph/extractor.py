@@ -32,14 +32,20 @@ from graph.models import (
     GraphEdge,
     GraphNode,
     KnowledgeGraph,
-    ExtractedTool,
 )
-from graph.schema_loader import build_tool_from_schema
+from graph.schema_loader import (
+    build_tool_from_schema,
+    get_class_field_specs,
+    get_relation_specs,
+    field_to_edge_type,
+)
 from graph.utils import print_graph_topology
 
 load_dotenv()
 
 SCHEMA_PATH = os.getenv("SCHEMA_PATH", "schema/customer_service.yaml")
+ROOT_CLASS = os.getenv("ROOT_CLASS", "SOP")
+LIST_FIELD = os.getenv("LIST_FIELD", "sops")
 
 # ---------------------------------------------------------------------------
 # LangGraph state
@@ -51,6 +57,7 @@ class ExtractionState(TypedDict):
     graph: Optional[KnowledgeGraph]
     errors: list[str]
     retry_count: int
+    validation_issues: list[dict[str, Any]]   # populated by validate_graph_node
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +115,8 @@ def _get_tool_schema() -> dict:
     """
     return build_tool_from_schema(
         schema_path=SCHEMA_PATH,
-        root_class="SOP",
-        list_field_name="sops",
+        root_class=ROOT_CLASS,
+        list_field_name=LIST_FIELD,
     )
 
 
@@ -261,6 +268,97 @@ def _unique_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
+def _to_snake(s: str) -> str:
+    """Convert CamelCase to snake_case: 'SubRule' → 'sub_rule'."""
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
+    return s.lower()
+
+
+def _class_to_id_key(class_name: str, root_class: str) -> str:
+    """Derive the ancestor-id key for a class: 'SOPStep' → 'step_id', 'SOP' → 'sop_id'."""
+    remainder = class_name[len(root_class):] if class_name.startswith(root_class) else class_name
+    if not remainder:
+        remainder = root_class
+    return f"{_to_snake(remainder)}_id"
+
+
+def _add_entity(
+    obj: dict[str, Any],
+    class_name: str,
+    ancestor_ids: dict[str, str],
+    nodes: list[GraphNode],
+    edges: list[GraphEdge],
+    node_registry: set[str],
+) -> None:
+    """Recursively add a node and its children to the graph (schema-driven)."""
+    node_id: str = obj.get("id") or str(uuid.uuid4())
+
+    rel_specs = get_relation_specs(SCHEMA_PATH, class_name)
+    relation_field_names = {spec.field_name for spec in rel_specs}
+
+    # Scalar data: all non-id, non-relation fields + accumulated ancestor ids
+    data: dict[str, Any] = {
+        k: v for k, v in obj.items()
+        if k != "id" and k not in relation_field_names
+    }
+    data.update(ancestor_ids)
+
+    if node_id not in node_registry:
+        node_registry.add(node_id)
+        nodes.append(GraphNode(id=node_id, node_type=class_name, data=data))
+
+    # Ancestor ids for direct children of this node
+    child_ancestor_ids = {**ancestor_ids, _class_to_id_key(class_name, ROOT_CLASS): node_id}
+
+    for spec in rel_specs:
+        children_raw = obj.get(spec.field_name)
+        if not children_raw:
+            continue
+
+        child_list: list[dict] = children_raw if isinstance(children_raw, list) else [children_raw]
+
+        # Sort by *_index field if the child class has one
+        try:
+            child_field_specs = get_class_field_specs(SCHEMA_PATH, spec.target_class)
+            index_field = next(
+                (s.name for s in child_field_specs if s.name.endswith("_index")),
+                None,
+            )
+        except Exception:
+            index_field = None
+
+        if index_field:
+            child_list = sorted(child_list, key=lambda c: c.get(index_field, 0))
+
+        prev_child_id: Optional[str] = None
+        for i, child_obj in enumerate(child_list):
+            child_id: str = child_obj.get("id") or str(uuid.uuid4())
+
+            # Edge from parent to child
+            edge_meta: dict[str, Any] = ({index_field: child_obj.get(index_field)}
+                                         if index_field else {"index": i + 1})
+            edges.append(GraphEdge(
+                source=node_id,
+                target=child_id,
+                edge_type=spec.edge_type,
+                metadata=edge_meta,
+            ))
+
+            # Sequential NEXT_* edge between consecutive ordered siblings
+            if index_field and prev_child_id is not None:
+                next_edge_type = f"NEXT_{_to_snake(spec.target_class[len(ROOT_CLASS):] or spec.target_class).upper()}"
+                edges.append(GraphEdge(
+                    source=prev_child_id,
+                    target=child_id,
+                    edge_type=next_edge_type,
+                    metadata={"when": "REJECTED"},
+                ))
+
+            _add_entity(child_obj, spec.target_class, child_ancestor_ids, nodes, edges, node_registry)
+            prev_child_id = child_id
+
+
 def build_graph_node(state: ExtractionState) -> dict[str, Any]:
     errors = list(state.get("errors", []))
     output: Optional[ExtractionOutput] = state.get("extracted_output")
@@ -271,77 +369,11 @@ def build_graph_node(state: ExtractionState) -> dict[str, Any]:
 
     nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
-    tool_registry: dict[str, str] = {}  # tool_name → node_id
+    node_registry: set[str] = set()  # deduplicate shared nodes (e.g. same Tool)
 
-    def add_node(nid: str, ntype: str, data: dict[str, Any]) -> None:
-        nodes.append(GraphNode(id=nid, node_type=ntype, data=data))
-
-    def add_edge(src: str, tgt: str, etype: str, meta: dict[str, Any] | None = None) -> None:
-        edges.append(GraphEdge(source=src, target=tgt, edge_type=etype, metadata=meta or {}))
-
-    def ensure_tool(tool: ExtractedTool) -> str:
-        if tool.name not in tool_registry:
-            tool_registry[tool.name] = tool.id
-            add_node(tool.id, "Tool", {
-                "name": tool.name,
-                "tool_type": tool.tool_type.value,
-                "description": tool.description,
-            })
-        return tool_registry[tool.name]
-
-    for sop in output.sops:
-        # SOP node
-        add_node(sop.id, "SOP", {
-            "name": sop.name,
-            "issue_type": sop.issue_type.value,
-            "sub_scenario": sop.sub_scenario,
-            "trigger_samples": sop.trigger_samples,
-        })
-
-        # Steps sorted by step_index
-        sorted_steps = sorted(sop.steps, key=lambda s: s.step_index)
-        for i, step in enumerate(sorted_steps):
-            add_node(step.id, "SOPStep", {
-                "step_index": step.step_index,
-                "goal": step.goal,
-                "acceptance_check": step.acceptance_check,
-                "sop_id": sop.id,
-            })
-            add_edge(sop.id, step.id, "HAS_STEP", {"step_index": step.step_index})
-
-            # NEXT_STEP edge to next step (when user rejects)
-            if i + 1 < len(sorted_steps):
-                add_edge(step.id, sorted_steps[i + 1].id, "NEXT_STEP", {"when": "REJECTED"})
-
-            # Rules sorted by rule_index
-            sorted_rules = sorted(step.rules, key=lambda r: r.rule_index)
-            for rule in sorted_rules:
-                add_node(rule.id, "SOPRule", {
-                    "rule_index": rule.rule_index,
-                    "condition": rule.condition,
-                    "execution_approach": rule.execution_approach,
-                    "reference_script": rule.reference_script,
-                    "step_id": step.id,
-                    "sop_id": sop.id,
-                })
-                add_edge(step.id, rule.id, "HAS_RULE", {"rule_index": rule.rule_index})
-
-                # Tools
-                for tool in rule.used_tools:
-                    tid = ensure_tool(tool)
-                    add_edge(rule.id, tid, "USES_TOOL", {})
-
-                # SubRules
-                for j, sub in enumerate(rule.sub_rules, start=1):
-                    add_node(sub.id, "SOPSubRule", {
-                        "condition": sub.condition,
-                        "execution_approach": sub.execution_approach,
-                        "reference_script": sub.reference_script,
-                        "rule_id": rule.id,
-                        "step_id": step.id,
-                        "sop_id": sop.id,
-                    })
-                    add_edge(rule.id, sub.id, "HAS_SUB_RULE", {"index": j})
+    raw = output.model_dump(mode="json")
+    for root_obj in raw.get(LIST_FIELD, []):
+        _add_entity(root_obj, ROOT_CLASS, {}, nodes, edges, node_registry)
 
     kg = KnowledgeGraph(nodes=nodes, edges=edges)
     return {"graph": kg, "errors": errors}
@@ -370,6 +402,161 @@ def save_graph_node(state: ExtractionState) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Validate graph node — schema-driven entity attribute checks
+# ---------------------------------------------------------------------------
+
+# Primitive LinkML range names that map to Python scalar types
+_PRIMITIVE_RANGES: frozenset[str] = frozenset({
+    "string", "str", "integer", "int", "float", "double",
+    "decimal", "boolean", "bool", "uri", "uriorcurie",
+    "date", "datetime", "curie", "ncname",
+})
+
+
+def validate_graph_node(state: ExtractionState) -> dict[str, Any]:
+    """Schema-driven validation of every node in the extracted KnowledgeGraph.
+
+    For each node, loads the FieldSpec list for its ``node_type`` from the
+    LinkML YAML (via ``get_class_field_specs``), then checks:
+
+    - ERROR  : required field absent or None/empty in node.data
+    - ERROR  : field value not in allowed enum values
+    - WARNING: recommended (non-required) field is None or empty string
+    - WARNING: multivalued field is present but empty list
+
+    Issues are collected into ``state["validation_issues"]`` as dicts:
+    ``{node_id, node_type, field, severity, message}``.
+
+    If any ERROR exists and retry_count < 3, the routing sends the pipeline
+    back to ``extract_sops`` for re-extraction.
+    """
+    errors = list(state.get("errors", []))
+    kg: Optional[KnowledgeGraph] = state.get("graph")
+    issues: list[dict[str, Any]] = []
+
+    if kg is None:
+        errors.append("validate_graph: no graph to validate")
+        return {"errors": errors, "validation_issues": issues}
+
+    # Cache field specs per node_type to avoid re-parsing YAML repeatedly
+    specs_cache: dict[str, list] = {}
+
+    # --- Structural check: duplicate node IDs ---
+    seen_ids: dict[str, int] = {}
+    for node in kg.nodes:
+        seen_ids[node.id] = seen_ids.get(node.id, 0) + 1
+    for nid, count in seen_ids.items():
+        if count > 1:
+            issues.append({
+                "node_id": nid, "node_type": "?",
+                "field": "id", "severity": "ERROR",
+                "message": f"Duplicate node id appears {count} times",
+            })
+
+    # --- Structural check: edge endpoints exist ---
+    node_id_set = {n.id for n in kg.nodes}
+    for edge in kg.edges:
+        for endpoint, label in ((edge.source, "source"), (edge.target, "target")):
+            if endpoint not in node_id_set:
+                issues.append({
+                    "node_id": f"{edge.source}→{edge.target}",
+                    "node_type": "Edge", "field": label, "severity": "ERROR",
+                    "message": f"Edge {label} '{endpoint}' not found in node list",
+                })
+
+    # --- Per-node attribute validation ---
+    for node in kg.nodes:
+        ntype = node.node_type
+
+        if ntype not in specs_cache:
+            try:
+                specs_cache[ntype] = get_class_field_specs(SCHEMA_PATH, ntype)
+            except Exception as exc:
+                issues.append({
+                    "node_id": node.id, "node_type": ntype,
+                    "field": "*", "severity": "WARNING",
+                    "message": f"Cannot load schema for '{ntype}': {exc}",
+                })
+                specs_cache[ntype] = []
+
+        for spec in specs_cache[ntype]:
+            # Relation fields (range is another class, not a primitive or enum)
+            # are not stored as scalar attributes in node.data — skip them.
+            if spec.range not in _PRIMITIVE_RANGES and not spec.enum_values:
+                continue
+
+            # The identifier field (e.g. "id") lives on node.id, not node.data.
+            # It is always populated by GraphNode construction — just verify it's non-empty.
+            if spec.name == "id":
+                if not node.id or not str(node.id).strip():
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": "id", "severity": "ERROR",
+                        "message": "Identifier field 'id' is empty",
+                    })
+                continue
+
+            value = node.data.get(spec.name)
+
+            # --- Missing or empty required field ---
+            if spec.required:
+                if value is None:
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": spec.name, "severity": "ERROR",
+                        "message": f"Required field '{spec.name}' is missing (None)",
+                    })
+                    continue
+                if not spec.multivalued and isinstance(value, str) and not value.strip():
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": spec.name, "severity": "ERROR",
+                        "message": f"Required field '{spec.name}' is empty string",
+                    })
+                    continue
+                if spec.multivalued and isinstance(value, list) and len(value) == 0:
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": spec.name, "severity": "WARNING",
+                        "message": f"Required multivalued field '{spec.name}' is empty list",
+                    })
+                    continue
+
+            # --- Optional but present: warn if empty ---
+            elif not spec.required and value is not None:
+                if not spec.multivalued and isinstance(value, str) and not value.strip():
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": spec.name, "severity": "WARNING",
+                        "message": f"Optional field '{spec.name}' is empty string",
+                    })
+
+            # --- Enum value check ---
+            if spec.enum_values and value is not None and not spec.multivalued:
+                if str(value) not in spec.enum_values:
+                    issues.append({
+                        "node_id": node.id, "node_type": ntype,
+                        "field": spec.name, "severity": "ERROR",
+                        "message": (
+                            f"Field '{spec.name}' value '{value}' not in allowed "
+                            f"enum values: {spec.enum_values}"
+                        ),
+                    })
+
+    # Log summary
+    error_count = sum(1 for i in issues if i["severity"] == "ERROR")
+    warn_count  = sum(1 for i in issues if i["severity"] == "WARNING")
+    print(f"[validator] {len(kg.nodes)} nodes checked — "
+          f"{error_count} errors, {warn_count} warnings")
+    for issue in issues:
+        prefix = "✗" if issue["severity"] == "ERROR" else "⚠"
+        print(f"  {prefix} [{issue['node_type']}] {issue['node_id']}.{issue['field']}: "
+              f"{issue['message']}")
+
+    return {"errors": errors, "validation_issues": issues}
+
+
+# ---------------------------------------------------------------------------
 # Routing: retry if extraction failed and retry_count < 3
 # ---------------------------------------------------------------------------
 
@@ -379,19 +566,32 @@ def should_retry(state: ExtractionState) -> str:
     return "build_graph"
 
 
+def should_retry_after_validation(state: ExtractionState) -> str:
+    """Re-extract if there are schema ERRORs and we haven't exhausted retries."""
+    issues = state.get("validation_issues", [])
+    has_errors = any(i["severity"] == "ERROR" for i in issues)
+    if has_errors and state.get("retry_count", 0) < 3:
+        print(f"[validator] ERROR issues found, retrying extraction "
+              f"(attempt {state.get('retry_count', 0) + 1}/3)")
+        return "extract_sops"
+    return "save_graph"
+
+
 # ---------------------------------------------------------------------------
 # Build and compile the extraction graph
 # ---------------------------------------------------------------------------
 
 def build_extraction_graph() -> CompiledStateGraph:
     builder = StateGraph(ExtractionState)
-    builder.add_node("extract_sops", extract_sops_node)
-    builder.add_node("build_graph", build_graph_node)
-    builder.add_node("save_graph", save_graph_node)
+    builder.add_node("extract_sops",   extract_sops_node)
+    builder.add_node("build_graph",    build_graph_node)
+    builder.add_node("validate_graph", validate_graph_node)
+    builder.add_node("save_graph",     save_graph_node)
 
     builder.add_edge(START, "extract_sops")
     builder.add_conditional_edges("extract_sops", should_retry)
-    builder.add_edge("build_graph", "save_graph")
+    builder.add_edge("build_graph", "validate_graph")
+    builder.add_conditional_edges("validate_graph", should_retry_after_validation)
     builder.add_edge("save_graph", END)
 
     return builder.compile()
@@ -411,6 +611,7 @@ def extract_and_build(raw_text: str) -> KnowledgeGraph:
         "graph": None,
         "errors": [],
         "retry_count": 0,
+        "validation_issues": [],
     })
     if final_state.get("errors"):
         for err in final_state["errors"]:

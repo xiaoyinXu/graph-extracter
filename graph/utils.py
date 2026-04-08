@@ -110,16 +110,15 @@ def subgraph_to_mermaid(subgraph: nx.DiGraph, node_map: dict[str, "GraphNode"]) 
             return node_id
         ntype = node.node_type
         d = node.data
-        if ntype == "SOP":
-            raw = f"SOP: {d.get('name', node_id)}"
-        elif ntype == "SOPStep":
-            raw = f"Step {d.get('step_index', '')}: {d.get('goal', node_id)}"
-        elif ntype == "SOPRule":
-            raw = f"Rule {d.get('rule_index', '')}: {d.get('condition', node_id)}"
-        elif ntype == "SOPSubRule":
-            raw = f"SubRule: {d.get('condition', node_id)}"
-        elif ntype == "Tool":
-            raw = f"Tool: {d.get('name', node_id)}"
+        # Render a human-readable label using common fields; falls back to node_id
+        if d.get("name"):
+            raw = f"{ntype}: {d['name']}"
+        elif d.get("goal"):
+            raw = f"{ntype} {d.get('step_index', '')}: {d['goal']}"
+        elif d.get("condition"):
+            idx = d.get("rule_index", "")
+            prefix = f"Rule {idx}: " if idx else ""
+            raw = f"{prefix}{d['condition']}"
         else:
             raw = node_id
         return raw.replace('"', "'")

@@ -1,16 +1,44 @@
 """
-DTO layer for knowledge graph. Typed entities mirror the customer_service.yaml schema.
-The generic Entity/Relationship/Graph are kept for backward compatibility.
+DTO layer for knowledge graph.
+
+``NodeDTO`` / ``EdgeDTO`` / ``KnowledgeGraphDTO`` are generic and schema-agnostic.
+The legacy SOP-specific classes (SOPDTO, SOPStepDTO, …) are kept for
+backward compatibility but should not be used in new code.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
-# Generic (backward-compatible)
+# Generic (schema-agnostic)
+# ---------------------------------------------------------------------------
+
+class NodeDTO(BaseModel):
+    """A single knowledge-graph node with typed metadata."""
+    id: str
+    node_type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class EdgeDTO(BaseModel):
+    """A directed edge in the knowledge graph."""
+    source: str
+    target: str
+    edge_type: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeGraphDTO(BaseModel):
+    """Schema-agnostic flat representation of the full knowledge graph."""
+    nodes: list[NodeDTO] = Field(default_factory=list)
+    edges: list[EdgeDTO] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Legacy backward-compatible classes (kept for existing callers)
 # ---------------------------------------------------------------------------
 
 class Entity(BaseModel):
@@ -26,14 +54,10 @@ class Graph(BaseModel):
     relationships: list[Relationship]
 
 
-# ---------------------------------------------------------------------------
-# Typed entities (mirror customer_service.yaml LinkML schema)
-# ---------------------------------------------------------------------------
-
 class ToolDTO(BaseModel):
     id: str
     name: str
-    tool_type: str  # ToolType enum value
+    tool_type: str
     description: Optional[str] = None
     mcp_endpoint: Optional[str] = None
 
@@ -67,17 +91,8 @@ class SOPStepDTO(BaseModel):
 class SOPDTO(BaseModel):
     id: str
     name: str
-    issue_type: str         # IssueType enum value
+    issue_type: str
     sub_scenario: Optional[str] = None
     trigger_samples: list[str] = []
     step_ids: list[str] = []
     quality_score: Optional[float] = None
-
-
-class KnowledgeGraphDTO(BaseModel):
-    """Flat DTO representation of the full knowledge graph."""
-    sops: list[SOPDTO] = []
-    steps: list[SOPStepDTO] = []
-    rules: list[SOPRuleDTO] = []
-    sub_rules: list[SOPSubRuleDTO] = []
-    tools: list[ToolDTO] = []

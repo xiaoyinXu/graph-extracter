@@ -1,19 +1,17 @@
 """
 Graph storage layer: load/save KnowledgeGraph JSON + build vector index.
 
-The vector index is rebuilt deterministically from graph.json on every load,
-so no separate index file is needed. For large graphs, swap InMemoryVectorStore
-with a persistent store (Chroma, FAISS, etc.).
+The vector index is rebuilt from graph.json on every load using Elasticsearch
+as the backing store (ES_HOSTS / ES_INDEX from .env).  The index is dropped
+and recreated on each build so the store always reflects the current graph.
 
-Indexed text fields (for retrieval coverage):
-  SOP          → trigger_samples, sub_scenario, name
-  SOPStep      → goal
-  SOPRule      → condition (+ reference_script snippet)
-  SOPSubRule   → condition
+Indexed text fields are declared in schema/customer_service.yaml via
+``x_index: true`` on individual attributes — no hardcoding in this file.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,16 +19,72 @@ from typing import Any, Optional
 
 import networkx as nx
 from dotenv import load_dotenv
+from elasticsearch import Elasticsearch
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_core.vectorstores import VectorStore
+from langchain_elasticsearch import ElasticsearchStore
+from langchain_elasticsearch.vectorstores import DistanceStrategy
 from langchain_openai import OpenAIEmbeddings
 
 from graph.models import GraphEdge, GraphNode, KnowledgeGraph
+from graph.schema_loader import FieldSpec, get_class_field_specs, get_relation_specs
+from graph.utils import subgraph_to_mermaid
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+# Path to the LinkML schema — resolved relative to this file so it works
+# regardless of the caller's working directory.
+_SCHEMA_PATH = str(Path(__file__).resolve().parent.parent / "schema" / "customer_service.yaml")
+# Override via env var if needed (e.g. in tests or alternative deployments)
+SCHEMA_PATH: str = os.getenv("SCHEMA_PATH", _SCHEMA_PATH)
+
+# Only string/str fields carry free text worth embedding.
+_STRING_RANGES: frozenset[str] = frozenset({"string", "str"})
+# Hard cap on characters embedded per field value to control token cost.
+_INDEX_MAX_CHARS: int = 300
+
 DEFAULT_GRAPH_PATH = "data/graph.json"
+
+# Root class for context traversal (env-override for generic deployments)
+ROOT_CLASS: str = os.getenv("ROOT_CLASS", "SOP")
+
+
+def _field_to_output_key(field_name: str) -> str:
+    """Map schema field name to context-dict output key.
+
+    ``used_tools`` → ``tools`` (strip the ``used_`` prefix).
+    Everything else keeps its field name unchanged.
+    """
+    if field_name.startswith("used_"):
+        return field_name[5:]
+    return field_name
+
+
+@dataclass
+class SubgraphResult:
+    """Result of a vector search + subgraph traversal.
+
+    Attributes
+    ----------
+    hits : list[dict]
+        Raw score-ordered vector-search results (multiple docs per node possible).
+    start_node_ids : list[str]
+        Deduplicated node IDs used as traversal entry points.  When
+        ``traverse_from_root=True`` these will be SOP root IDs; when
+        ``traverse_from_root=False`` they are the matched node IDs.
+    subgraph : nx.DiGraph
+        Merged connected subgraph of all traversal roots.  **Not JSON-serializable.**
+    mermaid : str
+        Mermaid ``graph TD`` diagram of the subgraph.
+    """
+
+    hits: list[dict[str, Any]]
+    start_node_ids: list[str]
+    subgraph: nx.DiGraph
+    mermaid: str
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +97,48 @@ def _create_embeddings() -> Embeddings:
         api_key=os.getenv("EMBEDDING_API_KEY"),
         base_url=os.getenv("EMBEDDING_BASE_URL"),
     )
+
+
+def _create_vector_store(
+    docs: list[Document],
+    embeddings: Embeddings,
+) -> VectorStore:
+    """Build an ElasticsearchStore from *docs*, dropping any existing index first.
+
+    Index configuration (ES 8.x dense_vector):
+      - field type : dense_vector, 1536 dims, cosine similarity
+      - strategy   : ApproxRetrievalStrategy (kNN, default)
+
+    Reads ES_HOSTS and ES_INDEX from the environment (defaults to
+    ``http://localhost:9200`` and ``kg_index`` respectively).  The index is
+    always rebuilt from scratch so the store exactly mirrors the current graph.
+
+    This function is intentionally kept as a module-level callable so unit
+    tests can patch it with an in-memory store to avoid hitting ES.
+    """
+    es_url = os.getenv("ES_HOSTS", "http://localhost:9200")
+    index_name = os.getenv("ES_INDEX", "kg_index")
+
+    # Always drop and recreate so the index mirrors the current graph exactly.
+    es_client = Elasticsearch(es_url)
+    if es_client.indices.exists(index=index_name):
+        es_client.indices.delete(index=index_name)
+
+    store_kwargs: dict[str, Any] = dict(
+        index_name=index_name,
+        embedding=embeddings,
+        es_url=es_url,
+        distance_strategy=DistanceStrategy.COSINE,
+        num_dimensions=1536,
+        # schema is stored as a nested object but not full-text indexed
+        metadata_mappings={"schema": {"type": "object", "enabled": False}},
+    )
+
+    if not docs:
+        # Empty graph: initialise the store (creates the index with correct mapping).
+        return ElasticsearchStore(**store_kwargs)
+
+    return ElasticsearchStore.from_documents(documents=docs, **store_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +157,7 @@ class GraphStore:
     node_map   : node_id → GraphNode (fast attribute lookup)
     """
     nx_graph: nx.DiGraph = field(default_factory=nx.DiGraph)
-    vector_store: Optional[InMemoryVectorStore] = None
+    vector_store: Optional[VectorStore] = None
     node_map: dict[str, GraphNode] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -114,68 +210,77 @@ class GraphStore:
         self.nx_graph = G
 
     def _build_vector_index(self, kg: KnowledgeGraph) -> None:
-        """Build InMemoryVectorStore from searchable text across all node types."""
+        """Build Elasticsearch vector index driven entirely by schema x_index annotations.
+
+        For each node type, ``get_class_field_specs`` is called once to discover
+        which fields carry ``x_index: true``.  Multivalued fields produce one
+        Document per list item; scalar fields produce a single Document.
+        No class names or field names are hardcoded here.
+        """
         embeddings = _create_embeddings()
         docs: list[Document] = []
+
+        # Cache indexed field specs per node_type (one schema parse per type).
+        specs_cache: dict[str, list[FieldSpec]] = {}
 
         for node in kg.nodes:
             d = node.data
             ntype = node.node_type
-            sop_id = d.get("sop_id", node.id if ntype == "SOP" else "")
 
-            if ntype == "SOP":
-                # index each trigger sample as a separate doc for better recall
-                for sample in d.get("trigger_samples", []):
-                    if sample.strip():
+            # sop_id: use the data field when present (child nodes); for root
+            # nodes that own the SOP hierarchy, fall back to node.id.
+            sop_id: str = d.get("sop_id") or node.id
+
+            if ntype not in specs_cache:
+                try:
+                    specs_cache[ntype] = [
+                        s for s in get_class_field_specs(SCHEMA_PATH, ntype)
+                        if s.indexed and s.range.lower() in _STRING_RANGES
+                    ]
+                except Exception as exc:
+                    logger.warning(
+                        "[storage] could not load field specs for %s from %s: %s",
+                        ntype, SCHEMA_PATH, exc,
+                    )
+                    specs_cache[ntype] = []
+
+            indexed_specs = specs_cache[ntype]
+            if not indexed_specs:
+                continue
+
+            def _meta(node_id: str = node.id, node_type: str = ntype,
+                      _sop_id: str = sop_id, _data: dict = d) -> dict[str, Any]:
+                return {
+                    "node_id": node_id,
+                    "node_type": node_type,
+                    "sop_id": _sop_id,
+                    "schema": _data,
+                }
+
+            for spec in indexed_specs:
+                value = d.get(spec.name)
+                if value is None:
+                    continue
+
+                if spec.multivalued and isinstance(value, list):
+                    # Each list item becomes its own Document for better recall.
+                    for item in value:
+                        text = str(item).strip()
+                        if len(text) > spec.min_index_chars:
+                            docs.append(Document(
+                                page_content=text[:_INDEX_MAX_CHARS],
+                                metadata=_meta(),
+                            ))
+                else:
+                    text = str(value).strip()
+                    if len(text) > spec.min_index_chars:
                         docs.append(Document(
-                            page_content=sample,
-                            metadata={"node_id": node.id, "node_type": ntype, "sop_id": node.id},
+                            page_content=text[:_INDEX_MAX_CHARS],
+                            metadata=_meta(),
                         ))
-                # index name and sub_scenario together
-                text_parts = [d.get("name", ""), d.get("sub_scenario", "")]
-                combined = " ".join(t for t in text_parts if t)
-                if combined.strip():
-                    docs.append(Document(
-                        page_content=combined,
-                        metadata={"node_id": node.id, "node_type": ntype, "sop_id": node.id},
-                    ))
 
-            elif ntype == "SOPStep":
-                goal = d.get("goal", "")
-                if goal.strip():
-                    docs.append(Document(
-                        page_content=goal,
-                        metadata={"node_id": node.id, "node_type": ntype, "sop_id": sop_id},
-                    ))
-
-            elif ntype == "SOPRule":
-                condition = d.get("condition", "")
-                if condition.strip():
-                    docs.append(Document(
-                        page_content=condition,
-                        metadata={"node_id": node.id, "node_type": ntype, "sop_id": sop_id},
-                    ))
-                # also index a snippet of the reference script for keyword matching
-                script = d.get("reference_script") or ""
-                if len(script) > 20:
-                    docs.append(Document(
-                        page_content=script[:300],
-                        metadata={"node_id": node.id, "node_type": "SOPRule_script",
-                                  "sop_id": sop_id},
-                    ))
-
-            elif ntype == "SOPSubRule":
-                condition = d.get("condition", "")
-                if condition.strip():
-                    docs.append(Document(
-                        page_content=condition,
-                        metadata={"node_id": node.id, "node_type": ntype, "sop_id": sop_id},
-                    ))
-
-        if docs:
-            self.vector_store = InMemoryVectorStore.from_documents(docs, embeddings)
-        else:
-            self.vector_store = InMemoryVectorStore(embeddings)
+        logger.info("[storage] indexing %d documents for %d nodes", len(docs), len(kg.nodes))
+        self.vector_store = _create_vector_store(docs, embeddings)
 
     def _to_kg(self) -> KnowledgeGraph:
         nodes = [self.node_map[nid] for nid in self.nx_graph.nodes]
@@ -242,76 +347,87 @@ class GraphStore:
         return ancestors
 
     def get_sop_context(self, sop_id: str) -> dict[str, Any]:
-        """
-        Return the full SOP tree sorted by step_index / rule_index.
+        """Return the full root-node tree sorted by index fields (schema-driven).
 
-        Returns:
+        Output structure mirrors the schema relation hierarchy:
         {
-          "sop": {...},
-          "steps": [
+          "<root_lower>": {...},           # e.g. "sop": {...}
+          "<field_key>": [                 # e.g. "steps": [
             {
-              "step": {...},
-              "rules": [
+              "<child_singular>": {...},   # e.g. "step": {...}
+              "<grandchild_key>": [        # e.g. "rules": [
                 {
-                  "rule": {...},
-                  "sub_rules": [...],
-                  "tools": [...]
+                  "<gchild_singular>": {...},
+                  "<leaf_field>": [node, ...],   # flat leaf lists
                 }
               ]
             }
           ]
         }
         """
-        sop_node = self.get_node(sop_id)
-        if not sop_node:
+        root_node = self.get_node(sop_id)
+        if not root_node:
             return {}
 
-        result: dict = {"sop": sop_node, "steps": []}
-
-        step_edges = [
-            (v, d)
-            for _, v, d in self.nx_graph.out_edges(sop_id, data=True)
-            if d.get("edge_type") == "HAS_STEP"
-        ]
-        step_edges.sort(key=lambda x: x[1].get("step_index", 0))
-
-        for step_id, _ in step_edges:
-            step_node = self.get_node(step_id)
-            if not step_node:
-                continue
-
-            rule_edges = [
-                (v, d)
-                for _, v, d in self.nx_graph.out_edges(step_id, data=True)
-                if d.get("edge_type") == "HAS_RULE"
-            ]
-            rule_edges.sort(key=lambda x: x[1].get("rule_index", 0))
-
-            step_rules = []
-            for rule_id, _ in rule_edges:
-                rule_node = self.get_node(rule_id)
-                if not rule_node:
-                    continue
-
-                sub_rules = [
-                    self.get_node(v)
-                    for _, v, d in self.nx_graph.out_edges(rule_id, data=True)
-                    if d.get("edge_type") == "HAS_SUB_RULE"
-                ]
-                tools = [
-                    self.get_node(v)
-                    for _, v, d in self.nx_graph.out_edges(rule_id, data=True)
-                    if d.get("edge_type") == "USES_TOOL"
-                ]
-                step_rules.append({
-                    "rule": rule_node,
-                    "sub_rules": [s for s in sub_rules if s],
-                    "tools": [t for t in tools if t],
-                })
-
-            result["steps"].append({"step": step_node, "rules": step_rules})
+        result: dict[str, Any] = {ROOT_CLASS.lower(): root_node}
+        root_rel_specs = get_relation_specs(SCHEMA_PATH, ROOT_CLASS)
+        for spec in root_rel_specs:
+            output_key = _field_to_output_key(spec.field_name)
+            result[output_key] = self._build_relation_list(sop_id, ROOT_CLASS, spec)
 
         return result
+
+    def _build_relation_list(
+        self,
+        node_id: str,
+        class_name: str,
+        spec: Any,
+    ) -> list[Any]:
+        """Build the child list for one relation spec (schema-driven, recursive)."""
+        edges = [
+            (v, d)
+            for _, v, d in self.nx_graph.out_edges(node_id, data=True)
+            if d.get("edge_type") == spec.edge_type
+        ]
+
+        # Sort by index field from edge metadata if present
+        try:
+            child_field_specs = get_class_field_specs(SCHEMA_PATH, spec.target_class)
+            index_field = next(
+                (s.name for s in child_field_specs if s.name.endswith("_index")),
+                None,
+            )
+        except Exception:
+            index_field = None
+
+        if index_field:
+            edges.sort(key=lambda x: x[1].get(index_field, 0))
+
+        output_key = _field_to_output_key(spec.field_name)
+        singular_key = output_key.rstrip("s")  # "steps" → "step", "rules" → "rule"
+
+        child_rel_specs = get_relation_specs(SCHEMA_PATH, spec.target_class)
+
+        items: list[Any] = []
+        for child_id, _ in edges:
+            child_node = self.get_node(child_id)
+            if not child_node:
+                continue
+
+            if child_rel_specs:
+                # Non-leaf: wrap in dict and recurse
+                entry: dict[str, Any] = {singular_key: child_node}
+                for child_spec in child_rel_specs:
+                    child_output_key = _field_to_output_key(child_spec.field_name)
+                    entry[child_output_key] = self._build_relation_list(
+                        child_id, spec.target_class, child_spec
+                    )
+                items.append(entry)
+            else:
+                # Leaf node: flat list
+                items.append(child_node)
+
+        return items
 
     def get_connected_subgraph(self, node_id: str) -> nx.DiGraph:
         """
@@ -328,8 +444,9 @@ class GraphStore:
 
     def get_rule_context(self, node_id: str, node_type: str) -> dict[str, Any]:
         """
-        Return focused context for a specific rule or sub-rule node.
-        Includes the node itself + its parent chain + siblings at same level.
+        Return focused context for a specific node.
+        Includes the node itself + its ancestor chain + siblings at same level
+        + non-tool children (e.g. sub-rules).
         """
         node = self.get_node(node_id)
         if not node:
@@ -337,31 +454,133 @@ class GraphStore:
 
         ancestors = self.get_ancestors(node_id)
 
-        # siblings: other rules in the same step
+        # Siblings: other nodes connected from the same parent with the same edge type
         preds = list(self.nx_graph.predecessors(node_id))
-        siblings = []
+        siblings: list[dict] = []
         if preds:
             parent_id = preds[0]
             parent_type = self.nx_graph.nodes[parent_id].get("node_type", "")
-            edge_type = "HAS_RULE" if parent_type == "SOPStep" else "HAS_SUB_RULE"
-            siblings = [
-                self.get_node(v)
-                for _, v, d in self.nx_graph.out_edges(parent_id, data=True)
-                if d.get("edge_type") == edge_type and v != node_id
-            ]
+            # Derive the edge type from the schema (parent → this node)
+            parent_rel_specs = get_relation_specs(SCHEMA_PATH, parent_type)
+            edge_type = next(
+                (spec.edge_type for spec in parent_rel_specs if spec.target_class == node_type),
+                None,
+            )
+            if edge_type:
+                siblings = [
+                    self.get_node(v)
+                    for _, v, d in self.nx_graph.out_edges(parent_id, data=True)
+                    if d.get("edge_type") == edge_type and v != node_id
+                ]
 
-        # children of this node
-        children = []
-        if node_type in ("SOPRule",):
-            children = [
-                self.get_node(v)
-                for _, v, d in self.nx_graph.out_edges(node_id, data=True)
-                if d.get("edge_type") == "HAS_SUB_RULE"
-            ]
+        # Children: non-tool relation children (e.g. sub-rules)
+        children: list[dict] = []
+        node_rel_specs = get_relation_specs(SCHEMA_PATH, node_type)
+        for spec in node_rel_specs:
+            if spec.edge_type.startswith("USES_"):
+                continue  # skip tool/service relations
+            for _, v, d in self.nx_graph.out_edges(node_id, data=True):
+                if d.get("edge_type") == spec.edge_type:
+                    child = self.get_node(v)
+                    if child:
+                        children.append(child)
 
         return {
             "node": node,
             "ancestors": ancestors,
             "siblings": [s for s in siblings if s],
-            "children": [c for c in children if c],
+            "children": children,
         }
+
+    # ------------------------------------------------------------------
+    # Vector search + subgraph traversal (combined pipeline)
+    # ------------------------------------------------------------------
+
+    def _find_root(self, node_id: str) -> str:
+        """Walk upward through predecessors to find the topmost ancestor node.
+
+        Used only as a fallback when a hit has no ``sop_id`` (e.g. Tool nodes).
+        Prefer resolving via ``sop_id`` for SOP-hierarchy nodes.
+        """
+        ancestors = self.get_ancestors(node_id)
+        return ancestors[0]["id"] if ancestors else node_id
+
+    def search_and_traverse(
+        self,
+        query: str,
+        k: int = 3,
+        traverse_from_root: bool = False,
+    ) -> SubgraphResult:
+        """
+        Vector-search for nodes matching *query*, then traverse each matched
+        node's connected subgraph and return a merged result.
+
+        Parameters
+        ----------
+        query : str
+            Natural-language text to search for.
+        k : int
+            Number of top vector-search document hits to consider (default 3).
+            Note: the vector index stores multiple docs per node (one per indexed
+            text field), so the actual number of unique nodes may be lower than k.
+        traverse_from_root : bool
+            If ``True``, resolve each hit's root SOP node (via the indexed
+            ``sop_id``) and traverse the **full SOP subtree** from there.
+            If ``False`` (default), traverse the subgraph downward from the
+            matched node itself for a focused result.
+
+        Returns
+        -------
+        SubgraphResult
+            ``hits``           — raw score-ordered vector-search results
+            ``start_node_ids`` — deduplicated IDs used as traversal entry points
+            ``subgraph``       — merged ``nx.DiGraph`` of all traversed nodes
+            ``mermaid``        — Mermaid ``graph TD`` diagram of the subgraph
+        """
+        hits = self.similarity_search(query, k=k)
+
+        if not hits:
+            return SubgraphResult(
+                hits=[],
+                start_node_ids=[],
+                subgraph=nx.DiGraph(),
+                mermaid="graph TD",
+            )
+
+        # Deduplicate hits: keep best score per node_id (vector index stores
+        # multiple docs per node for different text fields, e.g. trigger samples)
+        seen_hits: dict[str, dict[str, Any]] = {}
+        for hit in hits:
+            nid = hit["node_id"]
+            if nid not in seen_hits or hit["score"] > seen_hits[nid]["score"]:
+                seen_hits[nid] = hit
+        deduped_hits = list(seen_hits.values())
+
+        # Determine traversal entry point for each unique matched node.
+        # When traverse_from_root=True, use the indexed sop_id as the canonical
+        # root — this avoids ambiguous predecessor walks on multi-parent nodes.
+        start_ids: list[str] = []
+        seen_starts: set[str] = set()
+        for hit in deduped_hits:
+            if traverse_from_root:
+                sop_id = hit.get("sop_id", "")
+                start = sop_id if sop_id and sop_id in self.nx_graph else self._find_root(hit["node_id"])
+            else:
+                start = hit["node_id"]
+            if start not in seen_starts:
+                seen_starts.add(start)
+                start_ids.append(start)
+
+        # Merge all connected subgraphs (safe to compose: all share the same
+        # base graph so node attribute conflicts cannot occur)
+        subgraphs = [self.get_connected_subgraph(sid) for sid in start_ids]
+        merged: nx.DiGraph = nx.compose_all(subgraphs) if subgraphs else nx.DiGraph()
+
+        mermaid = subgraph_to_mermaid(merged, self.node_map)
+
+        return SubgraphResult(
+            hits=hits,
+            start_node_ids=start_ids,
+            subgraph=merged,
+            mermaid=mermaid,
+        )

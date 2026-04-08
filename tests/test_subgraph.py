@@ -10,6 +10,7 @@ from __future__ import annotations
 import networkx as nx
 import pytest
 from unittest.mock import patch
+from langchain_core.vectorstores import InMemoryVectorStore
 
 from graph.models import KnowledgeGraph
 from graph.storage import GraphStore
@@ -22,8 +23,12 @@ from tests.conftest import FakeEmbeddings
 # ---------------------------------------------------------------------------
 
 def make_store(kg: KnowledgeGraph) -> GraphStore:
-    """Build a GraphStore without calling the real OpenAI embeddings API."""
-    with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()):
+    """Build a GraphStore without real embeddings or Elasticsearch."""
+    def fake_vs(docs, emb):
+        return InMemoryVectorStore.from_documents(docs, emb) if docs else InMemoryVectorStore(emb)
+
+    with patch("graph.storage._create_embeddings", return_value=FakeEmbeddings()), \
+         patch("graph.storage._create_vector_store", side_effect=fake_vs):
         return GraphStore.from_kg(kg)
 
 
