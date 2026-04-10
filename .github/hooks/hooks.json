@@ -4,9 +4,8 @@
     "sessionStart": [
       {
         "type": "command",
-        "bash": "./scripts/session-banner.sh",
-        "powershell": "./scripts/session-banner.ps1",
-        "cwd": ".github/hooks",
+        "bash": "echo \"1\" >> 1.log",
+        "cwd": ".",
         "timeoutSec": 10
       }
     ],
