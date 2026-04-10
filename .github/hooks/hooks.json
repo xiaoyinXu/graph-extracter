@@ -1,7 +1,7 @@
 {
   "version": 1,
   "hooks": {
-    "sessionStart": [
+    "userPromptSubmitted": [
       {
         "type": "command",
         "bash": "echo \"Session started: $(date)\" >> logs/session.log",
