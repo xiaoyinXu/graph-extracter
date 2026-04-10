@@ -10,6 +10,7 @@ dependencies = [
     "langchain-elasticsearch>=1.0.0",
     "langchain-openai>=1.1.12",
     "langgraph>=1.1.6",
+    "linkml-runtime>=1.10.0",
     "networkx>=3.6.1",
     "numpy>=2.4.4",
     "pydantic>=2.12.5",

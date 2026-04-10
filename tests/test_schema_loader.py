@@ -3,14 +3,33 @@ Unit tests for graph/schema_loader.py — dynamic OpenAI tool schema builder.
 """
 from __future__ import annotations
 
+import os
+import tempfile
+import textwrap
 from typing import Any, Optional
 
 import pytest
 
-from graph.schema_loader import build_tool_from_schema, _resolve_range, _class_to_json_schema
+from graph.schema_loader import build_tool_from_schema, _SCHEMA_CACHE
 
 SCHEMA_PATH = "schema/customer_service.yaml"
 
+
+# ---------------------------------------------------------------------------
+# Helper: build a tool from a minimal inline YAML schema
+# ---------------------------------------------------------------------------
+
+def _tool_from_yaml(yaml_src: str, root: str = "Root", list_field: str = "items") -> dict:
+    """Write *yaml_src* to a temp file and build a tool schema from it."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as fh:
+        fh.write(textwrap.dedent(yaml_src))
+        path = fh.name
+    try:
+        _SCHEMA_CACHE.pop(path, None)
+        return build_tool_from_schema(path, root_class=root, list_field_name=list_field)
+    finally:
+        os.unlink(path)
+        _SCHEMA_CACHE.pop(path, None)
 
 # ---------------------------------------------------------------------------
 # Top-level tool structure
@@ -163,43 +182,47 @@ class TestMultivalued:
 
 class TestCircularReference:
     def test_circular_ref_rendered_as_string(self):
-        """
-        If a class references itself (e.g. SOPStep.next_step → SOPStep),
-        the circular reference must be rendered as {"type": "string"}, not recurse.
-        """
-        classes = {
-            "Node": {
-                "attributes": {
-                    "id": {"range": "string", "identifier": True},
-                    "child": {"range": "Node"},  # self-reference
-                }
-            }
-        }
-        enums: dict = {}
-        schema = _class_to_json_schema(
-            "Node", classes, enums,
-            default_range="string",
-            visiting=frozenset(),
-            skip_fields=frozenset(),
-            max_depth=10,
-            depth=0,
-        )
-        child_prop = schema["properties"]["child"]
-        # Should be a string (circular ref fallback), not another object
+        """Self-referencing class must be rendered as {"type": "string"}, not recurse."""
+        tool = _tool_from_yaml("""
+            id: test
+            name: test
+            default_range: string
+            classes:
+              Root:
+                attributes:
+                  id:
+                    range: string
+                    identifier: true
+                  child:
+                    range: Root
+        """, root="Root")
+        root_schema = tool["function"]["parameters"]["properties"]["items"]["items"]
+        child_prop = root_schema["properties"]["child"]
         assert child_prop["type"] == "string"
 
     def test_no_infinite_recursion(self):
-        """Deep mutual refs must not raise RecursionError."""
-        classes = {
-            "A": {"attributes": {"b": {"range": "B"}}},
-            "B": {"attributes": {"a": {"range": "A"}}},
-        }
-        # Should complete without RecursionError
-        schema = _class_to_json_schema(
-            "A", classes, {}, "string",
-            frozenset(), frozenset(), max_depth=5, depth=0,
-        )
-        assert schema["type"] == "object"
+        """Mutual class references must not raise RecursionError."""
+        tool = _tool_from_yaml("""
+            id: test
+            name: test
+            default_range: string
+            classes:
+              Root:
+                attributes:
+                  id:
+                    range: string
+                    identifier: true
+                  child:
+                    range: Child
+              Child:
+                attributes:
+                  id:
+                    range: string
+                    identifier: true
+                  parent:
+                    range: Root
+        """, root="Root")
+        assert tool["function"]["parameters"]["type"] == "object"
 
 
 # ---------------------------------------------------------------------------
@@ -207,40 +230,59 @@ class TestCircularReference:
 # ---------------------------------------------------------------------------
 
 class TestResolveRange:
-    def _call(self, range_type: str, classes: Optional[dict[str, Any]] = None, enums: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        return _resolve_range(
-            range_type,
-            classes or {},
-            enums or {},
-            default_range="string",
-            visiting=frozenset(),
-            skip_fields=frozenset(),
-            max_depth=5,
-            depth=0,
-        )
+    """Tests that LinkML primitive ranges are mapped to the correct JSON Schema types."""
+
+    def _field_schema(self, range_type: str) -> dict[str, Any]:
+        """Build a minimal one-field schema and return that field's JSON Schema."""
+        tool = _tool_from_yaml(f"""
+            id: test
+            name: test
+            default_range: string
+            classes:
+              Root:
+                attributes:
+                  myfield:
+                    range: {range_type}
+        """, root="Root")
+        return tool["function"]["parameters"]["properties"]["items"]["items"]["properties"]["myfield"]
 
     def test_string(self):
-        assert self._call("string") == {"type": "string"}
+        assert self._field_schema("string") == {"type": "string"}
 
     def test_integer(self):
-        assert self._call("integer") == {"type": "integer"}
+        assert self._field_schema("integer") == {"type": "integer"}
 
     def test_float(self):
-        assert self._call("float") == {"type": "number"}
+        assert self._field_schema("float") == {"type": "number"}
 
     def test_boolean(self):
-        assert self._call("boolean") == {"type": "boolean"}
+        assert self._field_schema("boolean") == {"type": "boolean"}
 
     def test_case_insensitive(self):
-        assert self._call("String") == {"type": "string"}
-        assert self._call("INTEGER") == {"type": "integer"}
+        assert self._field_schema("String") == {"type": "string"}
+        assert self._field_schema("INTEGER") == {"type": "integer"}
 
     def test_unknown_range_falls_back_to_string(self):
-        result = self._call("SomeUnknownType")
+        result = self._field_schema("SomeUnknownType")
         assert result == {"type": "string"}
 
     def test_enum_range(self):
-        enums = {"Color": {"permissible_values": {"RED": {}, "GREEN": {}, "BLUE": {}}}}
-        result = self._call("Color", enums=enums)
-        assert result["type"] == "string"
-        assert set(result["enum"]) == {"RED", "GREEN", "BLUE"}
+        tool = _tool_from_yaml("""
+            id: test
+            name: test
+            default_range: string
+            classes:
+              Root:
+                attributes:
+                  color:
+                    range: Color
+            enums:
+              Color:
+                permissible_values:
+                  RED: {}
+                  GREEN: {}
+                  BLUE: {}
+        """, root="Root")
+        color = tool["function"]["parameters"]["properties"]["items"]["items"]["properties"]["color"]
+        assert color["type"] == "string"
+        assert set(color["enum"]) == {"RED", "GREEN", "BLUE"}

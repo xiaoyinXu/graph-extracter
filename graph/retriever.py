@@ -5,9 +5,9 @@ Workflow: query → search_nodes → expand_context → generate_answer
 
 Node-level retrieval: returns matched (node_id, node_type, score) tuples,
 then expands only the relevant ancestor chain + local children rather than
-the full SOP tree, keeping LLM context tight.
+the full entity tree, keeping LLM context tight.
 
-For SOP-level queries (broad intent), it falls back to full SOP context.
+For root-class queries (broad intent), it falls back to full entity context.
 """
 from __future__ import annotations
 
@@ -23,13 +23,13 @@ from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
 
 from graph.storage import GraphStore, SubgraphResult
-from graph.schema_loader import get_class_field_specs
+from graph.schema_loader import get_class_field_specs, get_root_class
 from graph.utils import print_graph_topology
 
 load_dotenv()
 
 SCHEMA_PATH = os.getenv("SCHEMA_PATH", "schema/customer_service.yaml")
-ROOT_CLASS = os.getenv("ROOT_CLASS", "SOP")
+_ROOT_CLASS: str = get_root_class(SCHEMA_PATH)
 
 # ---------------------------------------------------------------------------
 # LangGraph state
@@ -37,9 +37,9 @@ ROOT_CLASS = os.getenv("ROOT_CLASS", "SOP")
 
 class RetrievalState(TypedDict):
     query: str
-    # search results: list of {node_id, node_type, sop_id, score, text}
+    # search results: list of {node_id, node_type, root_id, score, text}
     matched_hits: list[dict]
-    # expanded context dicts (one per unique SOP or focused rule context)
+    # expanded context dicts (one per unique root entity or focused node context)
     contexts: list[dict]
     # human-readable formatted context passed to the answer LLM
     formatted_context: str
@@ -63,13 +63,14 @@ def _create_llm() -> ChatOpenAI:
 # Context formatter
 # ---------------------------------------------------------------------------
 
-def _format_sop_context(ctx: dict) -> str:
-    """Render full SOP context as structured text for the LLM."""
+def _format_root_context(ctx: dict) -> str:
+    """Render full root-entity context as structured text for the LLM."""
     lines = []
-    sop = ctx.get("sop", {})
-    lines.append(f"## SOP: {sop.get('name', '')} [{sop.get('issue_type', '')}]")
-    if sop.get("sub_scenario"):
-        lines.append(f"细分场景: {sop['sub_scenario']}")
+    root_key = _ROOT_CLASS.lower()
+    root_node = ctx.get(root_key, {})
+    lines.append(f"## {_ROOT_CLASS}: {root_node.get('name', '')} [{root_node.get('issue_type', '')}]")
+    if root_node.get("sub_scenario"):
+        lines.append(f"细分场景: {root_node['sub_scenario']}")
 
     for step_item in ctx.get("steps", []):
         step = step_item["step"]
@@ -165,15 +166,15 @@ def expand_context_node(state: RetrievalState, *, store: GraphStore) -> dict[str
     Expand each hit to its context.
 
     Strategy:
-    - If the top hit is a SOP node OR score is high (≥0.85 cosine): return full SOP context
-    - Otherwise: return focused rule/sub-rule context + ancestors
-    - Deduplicate by sop_id to avoid redundant context
+    - If the top hit is a root-class node OR score is high (≥0.85 cosine): return full entity context
+    - Otherwise: return focused child-node context + ancestors
+    - Deduplicate by root_id to avoid redundant context
     """
     hits = state.get("matched_hits", [])
     if not hits:
         return {"contexts": [], "formatted_context": "未找到相关知识图谱内容。"}
 
-    seen_sop_ids: set[str] = set()
+    seen_root_ids: set[str] = set()
     contexts: list[dict] = []
     formatted_parts: list[str] = []
 
@@ -181,48 +182,48 @@ def expand_context_node(state: RetrievalState, *, store: GraphStore) -> dict[str
     sorted_hits = sorted(hits, key=lambda h: h["score"], reverse=True)
 
     for hit in sorted_hits[:5]:  # cap at 5 to keep context tight
-        sop_id = hit.get("sop_id", "")
+        root_id = hit.get("root_id", "")
         node_id = hit["node_id"]
         node_type = hit["node_type"]
         score = hit["score"]
 
-        # SOP-level hit or high-confidence match → full SOP context
-        if node_type == ROOT_CLASS or score >= 0.85:
-            target_sop_id = node_id if node_type == ROOT_CLASS else sop_id
-            if target_sop_id and target_sop_id not in seen_sop_ids:
-                seen_sop_ids.add(target_sop_id)
-                ctx = store.get_sop_context(target_sop_id)
+        # Root-level hit or high-confidence match → full entity context
+        if node_type == _ROOT_CLASS or score >= 0.85:
+            target_root_id = node_id if node_type == _ROOT_CLASS else root_id
+            if target_root_id and target_root_id not in seen_root_ids:
+                seen_root_ids.add(target_root_id)
+                ctx = store.get_root_context(target_root_id)
                 if ctx:
                     contexts.append(ctx)
-                    formatted_parts.append(_format_sop_context(ctx))
+                    formatted_parts.append(_format_root_context(ctx))
         else:
-            # Rule/SubRule hit → focused context
-            if sop_id not in seen_sop_ids:
+            # Focused node hit → focused context
+            if root_id not in seen_root_ids:
                 ctx = store.get_rule_context(node_id, node_type)
                 if ctx:
-                    # add sop_id to seen to prevent duplicate full SOP expansion
-                    seen_sop_ids.add(sop_id)
+                    # add root_id to seen to prevent duplicate full expansion
+                    seen_root_ids.add(root_id)
                     contexts.append(ctx)
                     formatted_parts.append(_format_rule_context(ctx))
 
     if not formatted_parts:
-        # fallback: return full SOP for the top hit's sop_id
-        top_sop_id = sorted_hits[0].get("sop_id", "")
-        if top_sop_id:
-            ctx = store.get_sop_context(top_sop_id)
+        # fallback: return full context for the top hit's root_id
+        top_root_id = sorted_hits[0].get("root_id", "")
+        if top_root_id:
+            ctx = store.get_root_context(top_root_id)
             if ctx:
                 contexts.append(ctx)
-                formatted_parts.append(_format_sop_context(ctx))
+                formatted_parts.append(_format_root_context(ctx))
 
     formatted_context = "\n\n---\n\n".join(formatted_parts) or "未找到相关知识图谱内容。"
     return {"contexts": contexts, "formatted_context": formatted_context}
 
 
 _ANSWER_SYSTEM = """\
-你是一个客服知识库助手。根据提供的SOP知识图谱内容，回答用户的问题。
+你是一个客服知识库助手。根据提供的知识图谱内容，回答用户的问题。
 
 要求：
-1. 直接引用相关SOP的执行思路和参考话术
+1. 直接引用相关知识的执行思路和参考话术
 2. 保留话术中的变量占位符（如 {{addon:11746}}）
 3. 如果涉及多个步骤，按步骤顺序说明处理方案
 4. 如果没有找到相关内容，明确说明
@@ -237,7 +238,7 @@ def generate_answer_node(state: RetrievalState) -> dict[str, Any]:
     """Use LLM to synthesize answer from retrieved context."""
     context = state.get("formatted_context", "")
     if not context or context == "未找到相关知识图谱内容。":
-        return {"answer": "抱歉，知识库中未找到与您问题相关的SOP内容。"}
+        return {"answer": "抱歉，知识库中未找到与您问题相关的内容。"}
 
     llm = _create_llm()
     system = _ANSWER_SYSTEM.format(context=context)
@@ -324,8 +325,8 @@ class KnowledgeGraphRetriever:
         k : int
             Number of top vector-search document hits to consider (default 3).
         traverse_from_root : bool
-            If ``True``, resolve the root SOP via ``sop_id`` and return the
-            full SOP context.  If ``False`` (default), traverse only from the
+            If ``True``, resolve the root entity via ``root_id`` and return the
+            full entity context.  If ``False`` (default), traverse only from the
             matched node downward for a focused result.
 
         Returns

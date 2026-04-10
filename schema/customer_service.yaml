@@ -348,6 +348,7 @@ classes:
   # 对应 Excel 列：细分场景 + sop方案 + mermaid_code + 客户原声
   # ---------------------------------------------------------------------------
   SOP:
+    tree_root: true
     description: >
       标准作业流程（Standard Operating Procedure）。
       以多步骤决策树结构建模，完整保留条件分支、话术和工具调用语义。

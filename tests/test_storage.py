@@ -123,18 +123,18 @@ class TestGetAncestors:
 
 
 # ---------------------------------------------------------------------------
-# get_sop_context
+# get_root_context
 # ---------------------------------------------------------------------------
 
 class TestGetSopContext:
     def test_sop_node_present(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("sop1")
+        ctx = store.get_root_context("sop1")
         assert ctx["sop"]["id"] == "sop1"
 
     def test_steps_sorted_by_index(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("sop1")
+        ctx = store.get_root_context("sop1")
         steps = ctx["steps"]
         assert len(steps) == 2
         indices = [s["step"]["step_index"] for s in steps]
@@ -142,28 +142,28 @@ class TestGetSopContext:
 
     def test_rules_sorted_by_index(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("sop1")
+        ctx = store.get_root_context("sop1")
         step1_rules = ctx["steps"][0]["rules"]
         indices = [r["rule"]["rule_index"] for r in step1_rules]
         assert indices == sorted(indices)
 
     def test_subrules_present(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("sop1")
+        ctx = store.get_root_context("sop1")
         rule1_ctx = ctx["steps"][0]["rules"][0]
         assert len(rule1_ctx["sub_rules"]) == 1
         assert rule1_ctx["sub_rules"][0]["id"] == "subrule1"
 
     def test_tools_present(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("sop1")
+        ctx = store.get_root_context("sop1")
         rule1_ctx = ctx["steps"][0]["rules"][0]
         assert len(rule1_ctx["tools"]) == 1
         assert rule1_ctx["tools"][0]["id"] == "tool1"
 
     def test_nonexistent_sop_returns_empty(self, minimal_kg):
         store = make_store(minimal_kg)
-        ctx = store.get_sop_context("no_such_sop")
+        ctx = store.get_root_context("no_such_sop")
         assert ctx == {}
 
 
@@ -218,7 +218,7 @@ class TestSimilaritySearch:
         for hit in results:
             assert "node_id" in hit
             assert "node_type" in hit
-            assert "sop_id" in hit
+            assert "root_id" in hit
             assert "score" in hit
             assert "text" in hit
 

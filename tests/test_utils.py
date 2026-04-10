@@ -34,7 +34,7 @@ class TestExtractionGraphTopology:
         assert "Extraction Pipeline" in output
 
     def test_all_user_nodes_listed(self, output):
-        for node in ("extract_sops", "build_graph", "save_graph"):
+        for node in ("extract_entities", "build_graph", "save_graph"):
             assert node in output
 
     def test_start_and_end_listed(self, output):
@@ -43,7 +43,7 @@ class TestExtractionGraphTopology:
 
     def test_fixed_edge_start_to_extract(self, output):
         assert "__start__" in output
-        assert "extract_sops" in output
+        assert "extract_entities" in output
 
     def test_build_to_save_edge(self, output):
         assert "build_graph" in output

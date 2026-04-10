@@ -6,7 +6,7 @@ Tests cover:
   - Empty store / no-hit edge cases
   - Deduplication of hits that share a node_id
   - traverse_from_root=False: traversal starts at the matched node
-  - traverse_from_root=True:  traversal starts at the topmost SOP ancestor
+  - traverse_from_root=True:  traversal starts at the topmost ancestor
   - Multiple hits → subgraphs are merged
   - Mermaid output structure
   - KnowledgeGraphRetriever.search_subgraph end-to-end
@@ -44,7 +44,7 @@ def _mock_hits(*node_ids: str, base_score: float = 0.9) -> list[dict]:
         {
             "node_id": nid,
             "node_type": "SOPRule",
-            "sop_id": "sop1",
+            "root_id": "sop1",
             "score": base_score - i * 0.05,
             "text": f"text for {nid}",
         }
@@ -191,8 +191,8 @@ class TestHitDeduplication:
         start_node_ids must contain each ID at most once."""
         store = make_store(minimal_kg)
         dup_hits = [
-            {"node_id": "rule1", "node_type": "SOPRule", "sop_id": "sop1", "score": 0.9, "text": "t1"},
-            {"node_id": "rule1", "node_type": "SOPRule", "sop_id": "sop1", "score": 0.8, "text": "t2"},
+            {"node_id": "rule1", "node_type": "SOPRule", "root_id": "sop1", "score": 0.9, "text": "t1"},
+            {"node_id": "rule1", "node_type": "SOPRule", "root_id": "sop1", "score": 0.8, "text": "t2"},
         ]
         with patch.object(store, "similarity_search", return_value=dup_hits):
             result = store.search_and_traverse("anything", traverse_from_root=False)
@@ -202,8 +202,8 @@ class TestHitDeduplication:
         """When two hits share a node_id, the one with the higher score is kept."""
         store = make_store(minimal_kg)
         dup_hits = [
-            {"node_id": "rule1", "node_type": "SOPRule", "sop_id": "sop1", "score": 0.7, "text": "low"},
-            {"node_id": "rule1", "node_type": "SOPRule", "sop_id": "sop1", "score": 0.95, "text": "high"},
+            {"node_id": "rule1", "node_type": "SOPRule", "root_id": "sop1", "score": 0.7, "text": "low"},
+            {"node_id": "rule1", "node_type": "SOPRule", "root_id": "sop1", "score": 0.95, "text": "high"},
         ]
         with patch.object(store, "similarity_search", return_value=dup_hits):
             result = store.search_and_traverse("anything", traverse_from_root=False)

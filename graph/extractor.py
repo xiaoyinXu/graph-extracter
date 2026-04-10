@@ -1,7 +1,7 @@
 """
-LangGraph-based SOP knowledge graph extraction pipeline.
+LangGraph-based knowledge graph extraction pipeline.
 
-Workflow: raw_text → extract_sops (LLM) → build_graph → save_graph
+Workflow: raw_text → extract_entities (LLM) → build_graph → save_graph
 
 Extraction strategy (three-tier fallback):
   1. Explicit Function/Tool Calling  ← primary: LLM calls the tool with structured args
@@ -17,7 +17,7 @@ import json
 import os
 import re
 import uuid
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -35,17 +35,20 @@ from graph.models import (
 )
 from graph.schema_loader import (
     build_tool_from_schema,
+    build_system_prompt,
     get_class_field_specs,
     get_relation_specs,
     field_to_edge_type,
+    get_root_class,
+    get_root_list_key,
 )
 from graph.utils import print_graph_topology
 
 load_dotenv()
 
 SCHEMA_PATH = os.getenv("SCHEMA_PATH", "schema/customer_service.yaml")
-ROOT_CLASS = os.getenv("ROOT_CLASS", "SOP")
-LIST_FIELD = os.getenv("LIST_FIELD", "sops")
+_ROOT_CLASS: str = get_root_class(SCHEMA_PATH)
+_LIST_FIELD: str = get_root_list_key(SCHEMA_PATH, _ROOT_CLASS)
 
 # ---------------------------------------------------------------------------
 # LangGraph state
@@ -53,6 +56,7 @@ LIST_FIELD = os.getenv("LIST_FIELD", "sops")
 
 class ExtractionState(TypedDict):
     raw_text: str
+    schema_path: str   # empty string = use module-level SCHEMA_PATH default
     extracted_output: Optional[ExtractionOutput]
     graph: Optional[KnowledgeGraph]
     errors: list[str]
@@ -74,58 +78,7 @@ def _create_llm(temperature: float = 0.0) -> ChatOpenAI:
 
 
 # ---------------------------------------------------------------------------
-# Extraction prompt + Tool schema
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """\
-你是一个SOP流程知识图谱提取专家。请调用 extract_sop_knowledge_graph 工具，\
-从给定的SOP文本中提取完整的知识图谱结构。
-
-## 实体类型说明
-- SOP：标准作业流程，含名称、问题类型(issue_type)、细分场景(sub_scenario)、触发样本(trigger_samples)
-- SOPStep：步骤，含步骤编号(step_index)、目标(goal)、用户接受检验点(acceptance_check)
-- SOPRule：规则，含规则编号(rule_index)、触发条件(condition)、执行思路(execution_approach)、参考话术(reference_script)
-- SOPSubRule：追问分支，含条件(condition)、执行思路、参考话术
-- Tool：工具调用，含名称(name)、类型(tool_type)
-
-## 枚举值
-issue_type: SHIPPING_QUERY | BILLING | TRACKING | DELIVERY_URGE | STUDENT_DISCOUNT |
-            COMPLAINT | ORDER_PLACING | REFUND | OTHER | HANDOVER_GAP | STATION_STAY_GAP | POST_DELIVERY_LOSS
-tool_type:  TICKET | GROUP_CHAT | QUERY | NOTIFY | ESCALATE
-
-## 文本结构规律
-- "第X步" → SOPStep，step_index = X；"目标：" → goal
-- 数字序号 → SOPRule（rule_index = 序号）；"执行思路：" / "参考话术：" → 对应字段
-- "如果用户追问..." → SOPSubRule；"如果用户不认可...则执行第X步" → acceptance_check
-- 【工单新】→ Tool(name="工单新", tool_type="TICKET")
-- 【拉群】→ Tool(name="拉群", tool_type="GROUP_CHAT")
-
-## ID命名规范
-sop_{场景简写}_001 / {sop_id}_step_{N} / {step_id}_rule_{N} / {rule_id}_subrule_{N} / tool_{name}_001
-
-## 触发样本
-从规则触发条件和文本中抽取代表性客户话术（如"怎么包裹不动了""几点能到"等）
-"""
-
-
-def _get_tool_schema() -> dict:
-    """
-    Dynamically build the OpenAI function/tool schema from the LinkML YAML schema.
-    Called once per extraction; result could be cached if performance matters.
-    """
-    return build_tool_from_schema(
-        schema_path=SCHEMA_PATH,
-        root_class=ROOT_CLASS,
-        list_field_name=LIST_FIELD,
-    )
-
-
-def _get_tool_name() -> str:
-    return _get_tool_schema()["function"]["name"]
-
-
-# ---------------------------------------------------------------------------
-# Repair helper for plain-text fallback
+# Three extraction strategies
 # ---------------------------------------------------------------------------
 
 def _try_parse_json(text: str) -> Optional[dict]:
@@ -149,7 +102,11 @@ def _try_parse_json(text: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _extract_via_tool_calling(
-    llm: ChatOpenAI, text: str
+    llm: ChatOpenAI,
+    text: str,
+    schema_path: str,
+    root_class: str,
+    list_field: str,
 ) -> tuple[Optional[ExtractionOutput], str]:
     """
     Strategy 1 — Explicit Function / Tool Calling (primary).
@@ -159,14 +116,19 @@ def _extract_via_tool_calling(
     Parses AIMessage.tool_calls[0]["args"] (or additional_kwargs for providers
     that surface calls differently), then validates with Pydantic ExtractionOutput.
     """
-    tool_schema = _get_tool_schema()
+    tool_schema = build_tool_from_schema(
+        schema_path=schema_path, root_class=root_class, list_field_name=list_field
+    )
+    system_prompt = build_system_prompt(
+        schema_path=schema_path, root_class=root_class, list_field_name=list_field
+    )
     tool_name = tool_schema["function"]["name"]
     llm_with_tool = llm.bind_tools(
         [tool_schema],
         tool_choice={"type": "function", "function": {"name": tool_name}},
     )
     response: AIMessage = llm_with_tool.invoke([
-        SystemMessage(content=_SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=text),
     ])
 
@@ -186,17 +148,26 @@ def _extract_via_tool_calling(
 
 
 def _extract_via_json_mode(
-    llm: ChatOpenAI, text: str
+    llm: ChatOpenAI,
+    text: str,
+    schema_path: str,
+    root_class: str,
+    list_field: str,
 ) -> tuple[Optional[ExtractionOutput], str]:
     """
     Strategy 2 — JSON mode with dynamically built schema in system prompt.
     Used when the model does not support tool/function calling.
     """
-    tool_schema = _get_tool_schema()
+    tool_schema = build_tool_from_schema(
+        schema_path=schema_path, root_class=root_class, list_field_name=list_field
+    )
     schema_hint = json.dumps(tool_schema["function"]["parameters"], ensure_ascii=False, indent=2)
+    system_prompt = build_system_prompt(
+        schema_path=schema_path, root_class=root_class, list_field_name=list_field
+    )
     prompt = (
-        f"{_SYSTEM_PROMPT}\n\n"
-        '## 输出格式\n以合法 JSON 返回，结构为 {"sops": [...]}。\n\n'
+        f"{system_prompt}\n\n"
+        f'## 输出格式\n以合法 JSON 返回，结构为 {{"{list_field}": [...]}}。\n\n'
         f"## JSON Schema（从YAML schema动态生成）\n{schema_hint}"
     )
     json_llm = llm.bind(response_format={"type": "json_object"})
@@ -212,14 +183,21 @@ def _extract_via_json_mode(
 
 
 def _extract_via_plain_text(
-    llm: ChatOpenAI, text: str
+    llm: ChatOpenAI,
+    text: str,
+    schema_path: str,
+    root_class: str,
+    list_field: str,
 ) -> tuple[Optional[ExtractionOutput], str]:
     """
     Strategy 3 — Plain text + regex JSON repair (last resort).
     """
+    system_prompt = build_system_prompt(
+        schema_path=schema_path, root_class=root_class, list_field_name=list_field
+    )
     response = llm.invoke([
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=f'请以JSON格式返回提取结果（{{"sops": [...]}}）：\n\n{text}'),
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f'请以JSON格式返回提取结果（{{"{list_field}": [...]}}）：\n\n{text}'),
     ])
     raw = response.content if hasattr(response, "content") else str(response)
     parsed = _try_parse_json(raw)
@@ -232,12 +210,17 @@ def _extract_via_plain_text(
 # Extraction node — tries all three strategies in order
 # ---------------------------------------------------------------------------
 
-def extract_sops_node(state: ExtractionState) -> dict[str, Any]:
+def extract_entities_node(state: ExtractionState) -> dict[str, Any]:
     errors = list(state.get("errors", []))
     retry = state.get("retry_count", 0)
     llm = _create_llm()
 
-    strategies: list[tuple[str, Callable[[ChatOpenAI, str], tuple[Optional[ExtractionOutput], str]]]] = [
+    # Resolve schema config from state (fallback to module-level defaults)
+    _sp = state.get("schema_path") or SCHEMA_PATH
+    _rc = get_root_class(_sp)
+    _lf = get_root_list_key(_sp, _rc)
+
+    strategies: list[tuple[str, Any]] = [
         ("function_calling", _extract_via_tool_calling),
         ("json_mode",        _extract_via_json_mode),
         ("plain_text",       _extract_via_plain_text),
@@ -245,7 +228,7 @@ def extract_sops_node(state: ExtractionState) -> dict[str, Any]:
 
     for strategy_name, strategy_fn in strategies:
         try:
-            result, err = strategy_fn(llm, state["raw_text"])
+            result, err = strategy_fn(llm, state["raw_text"], _sp, _rc, _lf)
             if result is not None:
                 print(f"[extractor] extraction succeeded via {strategy_name}")
                 return {
@@ -276,7 +259,11 @@ def _to_snake(s: str) -> str:
 
 
 def _class_to_id_key(class_name: str, root_class: str) -> str:
-    """Derive the ancestor-id key for a class: 'SOPStep' → 'step_id', 'SOP' → 'sop_id'."""
+    """Derive the ancestor-id key for a class relative to the root.
+
+    Examples (root_class='SOP'): 'SOPStep' → 'step_id', 'SOP' → 'sop_id'.
+    For classes that don't start with root_class, the full snake_case name is used.
+    """
     remainder = class_name[len(root_class):] if class_name.startswith(root_class) else class_name
     if not remainder:
         remainder = root_class
@@ -290,11 +277,13 @@ def _add_entity(
     nodes: list[GraphNode],
     edges: list[GraphEdge],
     node_registry: set[str],
+    schema_path: str,
+    root_class: str,
 ) -> None:
     """Recursively add a node and its children to the graph (schema-driven)."""
     node_id: str = obj.get("id") or str(uuid.uuid4())
 
-    rel_specs = get_relation_specs(SCHEMA_PATH, class_name)
+    rel_specs = get_relation_specs(schema_path, class_name)
     relation_field_names = {spec.field_name for spec in rel_specs}
 
     # Scalar data: all non-id, non-relation fields + accumulated ancestor ids
@@ -309,7 +298,7 @@ def _add_entity(
         nodes.append(GraphNode(id=node_id, node_type=class_name, data=data))
 
     # Ancestor ids for direct children of this node
-    child_ancestor_ids = {**ancestor_ids, _class_to_id_key(class_name, ROOT_CLASS): node_id}
+    child_ancestor_ids = {**ancestor_ids, _class_to_id_key(class_name, root_class): node_id}
 
     for spec in rel_specs:
         children_raw = obj.get(spec.field_name)
@@ -320,7 +309,7 @@ def _add_entity(
 
         # Sort by *_index field if the child class has one
         try:
-            child_field_specs = get_class_field_specs(SCHEMA_PATH, spec.target_class)
+            child_field_specs = get_class_field_specs(schema_path, spec.target_class)
             index_field = next(
                 (s.name for s in child_field_specs if s.name.endswith("_index")),
                 None,
@@ -347,7 +336,7 @@ def _add_entity(
 
             # Sequential NEXT_* edge between consecutive ordered siblings
             if index_field and prev_child_id is not None:
-                next_edge_type = f"NEXT_{_to_snake(spec.target_class[len(ROOT_CLASS):] or spec.target_class).upper()}"
+                next_edge_type = f"NEXT_{_to_snake(spec.target_class[len(root_class):] or spec.target_class).upper()}"
                 edges.append(GraphEdge(
                     source=prev_child_id,
                     target=child_id,
@@ -355,7 +344,7 @@ def _add_entity(
                     metadata={"when": "REJECTED"},
                 ))
 
-            _add_entity(child_obj, spec.target_class, child_ancestor_ids, nodes, edges, node_registry)
+            _add_entity(child_obj, spec.target_class, child_ancestor_ids, nodes, edges, node_registry, schema_path, root_class)
             prev_child_id = child_id
 
 
@@ -367,13 +356,17 @@ def build_graph_node(state: ExtractionState) -> dict[str, Any]:
         errors.append("build_graph: no extracted_output, skipping")
         return {"graph": KnowledgeGraph(), "errors": errors}
 
+    _sp = state.get("schema_path") or SCHEMA_PATH
+    _rc = get_root_class(_sp)
+    _lf = get_root_list_key(_sp, _rc)
+
     nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
     node_registry: set[str] = set()  # deduplicate shared nodes (e.g. same Tool)
 
     raw = output.model_dump(mode="json")
-    for root_obj in raw.get(LIST_FIELD, []):
-        _add_entity(root_obj, ROOT_CLASS, {}, nodes, edges, node_registry)
+    for root_obj in raw.get(_lf, []):
+        _add_entity(root_obj, _rc, {}, nodes, edges, node_registry, _sp, _rc)
 
     kg = KnowledgeGraph(nodes=nodes, edges=edges)
     return {"graph": kg, "errors": errors}
@@ -440,6 +433,7 @@ def validate_graph_node(state: ExtractionState) -> dict[str, Any]:
 
     # Cache field specs per node_type to avoid re-parsing YAML repeatedly
     specs_cache: dict[str, list] = {}
+    _sp = state.get("schema_path") or SCHEMA_PATH
 
     # --- Structural check: duplicate node IDs ---
     seen_ids: dict[str, int] = {}
@@ -470,7 +464,7 @@ def validate_graph_node(state: ExtractionState) -> dict[str, Any]:
 
         if ntype not in specs_cache:
             try:
-                specs_cache[ntype] = get_class_field_specs(SCHEMA_PATH, ntype)
+                specs_cache[ntype] = get_class_field_specs(_sp, ntype)
             except Exception as exc:
                 issues.append({
                     "node_id": node.id, "node_type": ntype,
@@ -562,7 +556,7 @@ def validate_graph_node(state: ExtractionState) -> dict[str, Any]:
 
 def should_retry(state: ExtractionState) -> str:
     if state.get("extracted_output") is None and state.get("retry_count", 0) < 3:
-        return "extract_sops"
+        return "extract_entities"
     return "build_graph"
 
 
@@ -573,7 +567,7 @@ def should_retry_after_validation(state: ExtractionState) -> str:
     if has_errors and state.get("retry_count", 0) < 3:
         print(f"[validator] ERROR issues found, retrying extraction "
               f"(attempt {state.get('retry_count', 0) + 1}/3)")
-        return "extract_sops"
+        return "extract_entities"
     return "save_graph"
 
 
@@ -583,13 +577,13 @@ def should_retry_after_validation(state: ExtractionState) -> str:
 
 def build_extraction_graph() -> CompiledStateGraph:
     builder = StateGraph(ExtractionState)
-    builder.add_node("extract_sops",   extract_sops_node)
+    builder.add_node("extract_entities", extract_entities_node)
     builder.add_node("build_graph",    build_graph_node)
     builder.add_node("validate_graph", validate_graph_node)
     builder.add_node("save_graph",     save_graph_node)
 
-    builder.add_edge(START, "extract_sops")
-    builder.add_conditional_edges("extract_sops", should_retry)
+    builder.add_edge(START, "extract_entities")
+    builder.add_conditional_edges("extract_entities", should_retry)
     builder.add_edge("build_graph", "validate_graph")
     builder.add_conditional_edges("validate_graph", should_retry_after_validation)
     builder.add_edge("save_graph", END)
@@ -601,12 +595,20 @@ def build_extraction_graph() -> CompiledStateGraph:
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_and_build(raw_text: str) -> KnowledgeGraph:
-    """Extract SOP entities from raw text and persist knowledge graph."""
+def extract_and_build(raw_text: str, schema_path: Optional[str] = None) -> KnowledgeGraph:
+    """Extract entities from raw text and persist knowledge graph.
+
+    Args:
+        raw_text:    Source document text to extract from.
+        schema_path: Optional path to a LinkML YAML schema.  When omitted the
+                     module-level ``SCHEMA_PATH`` (defaulting to
+                     ``schema/customer_service.yaml``) is used.
+    """
     graph = build_extraction_graph()
     print_graph_topology(graph, name="Extraction Pipeline")
     final_state = graph.invoke({
         "raw_text": raw_text,
+        "schema_path": schema_path or "",
         "extracted_output": None,
         "graph": None,
         "errors": [],

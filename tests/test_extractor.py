@@ -26,11 +26,11 @@ from graph.models import ExtractionOutput, GraphEdge, GraphNode, KnowledgeGraph
 class TestShouldRetry:
     def test_no_output_low_retry_count_retries(self):
         state = {"extracted_output": None, "retry_count": 0, "errors": []}
-        assert should_retry(state) == "extract_sops"
+        assert should_retry(state) == "extract_entities"
 
     def test_no_output_retry_count_2_still_retries(self):
         state = {"extracted_output": None, "retry_count": 2, "errors": []}
-        assert should_retry(state) == "extract_sops"
+        assert should_retry(state) == "extract_entities"
 
     def test_no_output_retry_count_3_stops(self):
         state = {"extracted_output": None, "retry_count": 3, "errors": []}
@@ -439,11 +439,11 @@ class TestShouldRetryAfterValidation:
 
     def test_error_low_retry_retries(self):
         issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]
-        assert should_retry_after_validation(self._state(issues, retry_count=0)) == "extract_sops"
+        assert should_retry_after_validation(self._state(issues, retry_count=0)) == "extract_entities"
 
     def test_error_retry_count_2_still_retries(self):
         issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]
-        assert should_retry_after_validation(self._state(issues, retry_count=2)) == "extract_sops"
+        assert should_retry_after_validation(self._state(issues, retry_count=2)) == "extract_entities"
 
     def test_error_retry_count_3_goes_to_save(self):
         issues = [{"severity": "ERROR", "field": "name", "node_id": "n", "node_type": "SOP", "message": "e"}]

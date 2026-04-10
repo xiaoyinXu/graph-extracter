@@ -1,0 +1,320 @@
+LinkML 技术详解：用语义模型驱动知识图谱提取
+==============================================
+
+作者：AI Engineering Team
+日期：2025
+
+
+## 一、什么是 LinkML
+
+LinkML（Linked data Modeling Language）是一套以 YAML 为载体的**语义数据建模语言**，
+由 LBNL（Lawrence Berkeley National Laboratory）主导开发，现已成为生物信息学和数字孪生
+领域的主流本体建模方案之一，同时被越来越多的 AI / NLP 应用采纳。
+
+官方网站：https://linkml.io
+GitHub：  https://github.com/linkml/linkml
+
+### 1.1 核心定位
+
+LinkML 不是 JSON Schema，也不是 OWL/RDF 的替代品——它处于二者之间：
+
+| 维度         | JSON Schema          | OWL / RDF           | LinkML                    |
+|--------------|----------------------|---------------------|---------------------------|
+| 表达方式     | JSON                 | Turtle / OWL/XML    | YAML（人类可读）          |
+| 语义丰富度   | 弱（结构约束）       | 极强（一阶逻辑）    | 中（描述逻辑子集）        |
+| 代码生成     | 有限                 | 无                  | Python / Java / TypeScript|
+| 与 LLM 结合  | 需要手写 schema      | 复杂                | 可直接生成 Tool Calling   |
+| 学习曲线     | 平缓                 | 陡峭                | 适中                      |
+
+LinkML 的核心价值：**将领域知识从代码里解耦，放进 YAML，让代码动态跟随 schema 演化。**
+
+
+## 二、核心概念速查
+
+### 2.1 Schema 文件头部
+
+```yaml
+id: http://my-company.com/customer-service   # 全局唯一 IRI（命名空间）
+name: customer_service
+imports:
+  - linkml:types          # 引入内置类型（string, integer, boolean…）
+prefixes:
+  cs: http://my-company.com/customer-service/
+  linkml: https://w3id.org/linkml/
+default_prefix: cs
+default_range: string     # 默认属性类型为 string
+```
+
+### 2.2 类（classes）
+
+```yaml
+classes:
+  SOPStep:
+    description: SOP 中的一个执行步骤
+    attributes:
+      id:
+        identifier: true   # 主键，SchemaView 可识别
+        required: true
+      name:
+        range: string
+        required: true
+        x_index: true      # 自定义扩展注解，标记可向量化检索的字段
+```
+
+关键属性语义：
+
+| 属性              | 含义                                       |
+|-------------------|--------------------------------------------|
+| `identifier: true`| 该字段是该类的主键                         |
+| `required: true`  | LLM 提取时必须填写                         |
+| `multivalued: true`| 该字段是一对多关系（生成 List[...]）       |
+| `range: ClassName`| 外键关联（生成嵌套对象）                   |
+| `tree_root: true` | 该类是知识图谱的根节点（每次提取的顶层对象）|
+
+### 2.3 枚举（enums）
+
+```yaml
+enums:
+  IssueType:
+    permissible_values:
+      DELIVERY_DELAY:  { description: "配送延误" }
+      LOST_PACKAGE:    { description: "包裹丢失" }
+```
+
+枚举用于约束 LLM 输出的离散值范围，避免自由文本带来的歧义。
+
+### 2.4 类型（types）
+
+LinkML 内置类型：`string`, `integer`, `float`, `boolean`, `uri`, `date`，
+通过 `imports: [linkml:types]` 引入，可直接在 `range` 中使用。
+
+### 2.5 tree_root 标注
+
+```yaml
+classes:
+  SOP:
+    tree_root: true        # <<< 根节点声明
+    description: 标准作业程序…
+```
+
+`tree_root: true` 声明该类为知识图谱的"入口实体"。
+SchemaView 通过它定位根类，动态生成 LLM 工具调用（Tool Calling）的顶层结构，
+无需在代码里硬编码类名。
+
+
+## 三、SchemaView：运行时查询接口
+
+LinkML 官方 Python 运行时库 `linkml-runtime` 提供 `SchemaView` 类，
+可在运行时对 schema 进行反射查询，类似 Java 的 `Class<?>`。
+
+### 3.1 安装
+
+```bash
+pip install linkml-runtime
+```
+
+### 3.2 常用操作
+
+```python
+from linkml_runtime.utils.schemaview import SchemaView
+
+sv = SchemaView("schema/customer_service.yaml")
+
+# 枚举所有类名
+sv.all_classes().keys()           # dict_keys(['SOP', 'SOPStep', 'SOPRule', ...])
+
+# 获取类的全部 slot（含继承）
+sv.all_slots()
+
+# 获取某个类的所有属性（含继承自父类的）
+sv.get_class("SOP").attributes    # OrderedDict[str, SlotDefinition]
+
+# 通过 induced_slot 获取 slot 的完整推断元数据（含继承覆盖）
+slot = sv.induced_slot("name", "SOPStep")
+slot.range        # 'string'
+slot.required     # True
+
+# 查询根节点
+root_classes = [
+    name for name, cls in sv.all_classes().items()
+    if getattr(cls, 'tree_root', False)
+]
+```
+
+### 3.3 动态 Pydantic 模型生成
+
+`linkml-runtime` 可从 schema 动态生成 Pydantic 模型（也支持 dataclasses / TypeScript）：
+
+```python
+from linkml.generators.pydanticgen import PydanticGenerator
+
+code = PydanticGenerator("schema/customer_service.yaml").serialize()
+exec(code)  # 动态注册模型类
+```
+
+但实际工程中，通常选择更轻量的方案：**直接用 SchemaView 构造 JSON Schema，
+作为 LLM Tool Calling 的参数描述**。
+
+
+## 四、在知识图谱提取项目中的实际用法
+
+### 4.1 整体架构
+
+```
+customer_service.yaml
+        │
+        ▼
+  schema_loader.py          ← SchemaView 封装层
+  ├── get_root_class()      ← 动态读取 tree_root 类名
+  ├── get_root_list_key()   ← 推断列表字段名（如 "sops"）
+  ├── build_tool_from_schema()  ← 生成 LLM Tool Calling JSON Schema
+  └── build_system_prompt() ← 生成 LLM System Prompt
+        │
+        ▼
+  extractor.py              ← LangGraph 提取节点
+  ├── extract_entities_node ← 调用 LLM，返回结构化 JSON
+  └── build_graph_node      ← JSON → KnowledgeGraph（NetworkX）
+        │
+        ▼
+  storage.py                ← GraphStore（NetworkX + ES 向量索引）
+  └── _build_vector_index() ← 按 x_index 注解选字段，写入 ES
+```
+
+### 4.2 动态生成 Tool Calling
+
+```python
+def build_tool_from_schema(
+    schema_path: str,
+    root_class: Optional[str] = None,
+) -> dict:
+    """
+    从 LinkML YAML 动态构造 OpenAI function calling tool 描述。
+    root_class 默认从 schema 的 tree_root 类推断。
+    """
+    sv = _load_schema(schema_path)
+    if root_class is None:
+        root_class = get_root_class(schema_path)
+
+    # 递归将 LinkML class → JSON Schema object
+    def class_to_schema(class_name: str, visited: set) -> dict:
+        ...
+
+    return {
+        "type": "function",
+        "function": {
+            "name": f"extract_{root_class.lower()}s",
+            "parameters": class_to_schema(root_class, set()),
+        }
+    }
+```
+
+关键优势：**schema 增减字段，Tool Calling 自动跟随，无需修改代码。**
+
+### 4.3 x_index 注解驱动向量索引
+
+`x_index: true` 是一个自定义扩展注解（LinkML 允许 `x_` 前缀扩展），
+用于标记哪些字段需要写入 Elasticsearch 向量索引。
+
+```python
+def _get_indexable_fields(self, class_name: str) -> list[str]:
+    """返回指定类中标记了 x_index: true 的字段名列表"""
+    cls = self.sv.get_class(class_name)
+    result = []
+    for attr_name, attr in (cls.attributes or {}).items():
+        annotations = getattr(attr, 'annotations', {}) or {}
+        if annotations.get('x_index', {}).get('value') == 'true':
+            result.append(attr_name)
+    return result
+```
+
+这样，ES 的向量化字段完全由 schema 决定，业务代码零硬编码。
+
+### 4.4 get_root_class() 的实现
+
+```python
+def get_root_class(schema_path: str) -> str:
+    sv = _load_schema(schema_path)
+    roots = [
+        name for name, cls in sv.all_classes().items()
+        if getattr(cls, 'tree_root', False)
+    ]
+    if len(roots) == 0:
+        raise ValueError(
+            f"Schema {schema_path} 没有 tree_root: true 的类，"
+            "请在根节点类上添加 tree_root: true"
+        )
+    if len(roots) > 1:
+        raise ValueError(
+            f"Schema {schema_path} 存在多个 tree_root 类：{roots}，"
+            "每个 schema 只允许一个根节点"
+        )
+    return roots[0]
+```
+
+
+## 五、最佳实践
+
+### 5.1 schema 设计原则
+
+1. **单一根节点**：每个业务域的 schema 只定义一个 `tree_root: true` 的类，
+   避免歧义。
+
+2. **identifier 必须唯一**：每个类至少有一个 `identifier: true` 字段，
+   知识图谱的节点去重依赖它。
+
+3. **description 是 Prompt 的一部分**：字段的 `description` 会被 `build_system_prompt`
+   直接注入到 LLM 系统提示中，写得越清晰，提取质量越高。
+
+4. **枚举代替自由文本**：凡是有限取值的字段，用 `enums` 而非 `range: string`。
+   LLM 会严格遵循枚举值，减少输出噪声。
+
+5. **x_index 保持克制**：只标记真正用于语义检索的字段（通常 5~8 个），
+   避免向量维度爆炸和索引成本上升。
+
+### 5.2 schema 演化策略
+
+- **新增字段**：直接加 `required: false` 的属性，存量数据不受影响。
+- **删除字段**：先改 `required: false`，等存量数据清理后再删除定义。
+- **重命名**：同时保留旧名（`aliases: [old_name]`）过渡，代码侧统一用新名。
+- **修改枚举值**：优先新增，不直接修改现有值（避免历史数据校验失败）。
+
+### 5.3 与 Pydantic 的关系
+
+本项目中，Pydantic 模型（`ExtractionOutput`、`ExtractedSOP` 等）由开发者手工编写，
+与 schema 保持**逻辑同步**（字段名、类型需一致），但不自动生成。
+
+如果团队规模增大，可以切换到 **LinkML codegen** 自动生成 Pydantic 模型，
+消除手工同步的维护成本：
+
+```bash
+# 一行命令生成 Pydantic v2 模型
+gen-pydantic schema/customer_service.yaml > dto/generated.py
+```
+
+
+## 六、常见问题
+
+**Q：SchemaView 加载时报 TypeError，提示 unexpected keyword argument**
+A：某些自定义扩展注解（如 `x_index`）不是标准 LinkML 关键字，
+   需要在传入 SchemaView 前从 `attributes` 的 YAML 中剥离，
+   或改写为 `annotations` 字典格式。
+   本项目在 `schema_loader.py` 的 `_load_schema()` 中已自动处理。
+
+**Q：tree_root 是否影响 schema 校验？**
+A：不影响数据校验逻辑，仅是一个元标注，供应用层（如本项目）识别根节点用途。
+
+**Q：multivalued 字段在 JSON Schema 中如何映射？**
+A：`multivalued: true` + `range: SomeClass` → JSON Schema 的 `{ "type": "array", "items": { "$ref": "#SomeClass" } }`。
+
+**Q：如何跨 schema 文件引用类型？**
+A：在 `imports` 中引入目标 schema 文件路径，然后在 `range` 中使用目标类名。
+   建议同时在 `prefixes` 中声明目标 schema 的 prefix 以避免命名冲突。
+
+
+## 七、相关资源
+
+- LinkML 官方文档：https://linkml.io/linkml/
+- LinkML GitHub：  https://github.com/linkml/linkml
+- SchemaView API： https://linkml.io/linkml-runtime/schemaview/
+- gen-pydantic 命令参考：https://linkml.io/linkml/generators/pydantic.html
+- LinkML 示例库：  https://github.com/linkml/linkml/tree/main/examples

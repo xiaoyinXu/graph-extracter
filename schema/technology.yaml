@@ -1,0 +1,296 @@
+id: http://my-company.com/technology
+name: technology
+description: >
+  技术栈语义模型（L1 领域层）。
+  核心关注点是"技术知识图谱"：Technology 以分类（Category）→ 特性（Feature）→
+  集成关系（Integration）→ 使用场景（UseCase）的层次结构建模，
+  完整保留技术选型的决策语义，而非将技术信息降级为纯文本字段。
+
+imports:
+  - linkml:types
+
+prefixes:
+  tech:   http://my-company.com/technology/
+  linkml: https://w3id.org/linkml/
+
+default_prefix: tech
+default_range: string
+
+# =============================================================================
+# Concept 层（枚举）
+# =============================================================================
+enums:
+
+  TechLayer:
+    description: >
+      技术栈层次枚举。描述一项技术所处的架构层级。
+    permissible_values:
+      FRONTEND:    { description: "前端（UI、Web、移动端）" }
+      BACKEND:     { description: "后端（服务、API、业务逻辑）" }
+      DATABASE:    { description: "数据库（关系型/非关系型/向量库）" }
+      INFRA:       { description: "基础设施（容器、CI/CD、云平台）" }
+      ML_AI:       { description: "机器学习/人工智能（模型、框架、平台）" }
+      MIDDLEWARE:  { description: "中间件（消息队列、缓存、网关）" }
+      DEVTOOL:     { description: "开发工具（IDE、测试、格式化、监控）" }
+
+  MaturityLevel:
+    description: 技术成熟度枚举，描述该技术在业界的采用状态
+    permissible_values:
+      EMERGING:   { description: "新兴（社区活跃但生产案例有限）" }
+      GROWING:    { description: "成长（生产验证中，部分大规模案例）" }
+      MATURE:     { description: "成熟（广泛生产采用，生态稳定）" }
+      LEGACY:     { description: "遗留（仍在维护但不推荐新项目采用）" }
+      DEPRECATED: { description: "已弃用（不再维护，建议迁移）" }
+
+  LicenseType:
+    description: 开源许可证类型
+    permissible_values:
+      MIT:        { description: "MIT License（宽松，商用友好）" }
+      APACHE2:    { description: "Apache 2.0（含专利授权，商用友好）" }
+      GPL:        { description: "GPL（Copyleft，衍生作品需开源）" }
+      BSD:        { description: "BSD License（宽松）" }
+      COMMERCIAL: { description: "商业许可（闭源或付费）" }
+      OTHER:      { description: "其他许可证" }
+
+  IntegrationDirection:
+    description: 技术集成方向
+    permissible_values:
+      USES:        { description: "主动使用（本技术依赖目标技术）" }
+      USED_BY:     { description: "被使用（本技术被目标技术依赖）" }
+      COMPATIBLE:  { description: "兼容（可互操作，无强依赖）" }
+      REPLACES:    { description: "替代（本技术可替换目标技术）" }
+
+  DifficultyLevel:
+    description: 学习曲线难度
+    permissible_values:
+      EASY:    { description: "入门简单（1 天内可上手）" }
+      MEDIUM:  { description: "中等（1~2 周熟练）" }
+      HARD:    { description: "较难（需要1个月以上深入学习）" }
+      EXPERT:  { description: "专家级（需要领域背景知识）" }
+
+# =============================================================================
+# Entity 层
+# =============================================================================
+classes:
+
+  # ---------------------------------------------------------------------------
+  # TechCategory：技术分类（L1 域内分类节点）
+  # ---------------------------------------------------------------------------
+  TechCategory:
+    description: 技术分类节点，按技术栈层次和职能对技术进行归类
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        description: 分类名称（如：Web框架、关系型数据库）
+      layer:
+        range: TechLayer
+        required: true
+        description: 所属技术架构层
+      description:
+        range: string
+        required: false
+      related_technologies:
+        range: Technology
+        multivalued: true
+        description: 该分类下的所有技术
+
+  # ---------------------------------------------------------------------------
+  # LearningResource：学习资源（文档、教程、书籍）
+  # ---------------------------------------------------------------------------
+  LearningResource:
+    description: 与某项技术关联的学习资源，包括官方文档、教程、书籍等
+    attributes:
+      id:
+        identifier: true
+        required: true
+      title:
+        range: string
+        required: true
+        description: 资源标题
+      url:
+        range: string
+        required: false
+        x_index: true
+        description: 资源链接（官网/GitHub/在线教程）
+      resource_type:
+        range: string
+        required: false
+        description: 资源类型（官方文档 / 教程 / 书籍 / 视频 / 博客）
+      language:
+        range: string
+        required: false
+        description: 语言（中文 / English）
+      difficulty:
+        range: DifficultyLevel
+        required: false
+        description: 适合的学习阶段
+
+  # ---------------------------------------------------------------------------
+  # Feature：技术特性（关键能力描述）
+  # ---------------------------------------------------------------------------
+  Feature:
+    description: >
+      技术的一个核心特性或能力点。
+      例如 FastAPI 的「自动生成 OpenAPI 文档」、Elasticsearch 的「全文检索」。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        x_index: true
+        description: 特性名称（简短，如：类型安全、热重载、水平扩展）
+      description:
+        range: string
+        required: true
+        x_index: true
+        description: 特性详细说明，含适用场景和注意事项
+      is_differentiator:
+        range: boolean
+        required: false
+        description: 是否为该技术的核心差异化优势（true = 区别于竞品的关键能力）
+
+  # ---------------------------------------------------------------------------
+  # UseCase：使用场景（技术适用的业务/技术场景）
+  # ---------------------------------------------------------------------------
+  UseCase:
+    description: >
+      描述一项技术适合解决的业务或技术问题。
+      例如 Redis 适用于「缓存高频读取数据」「分布式会话存储」。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      scenario:
+        range: string
+        required: true
+        x_index: true
+        description: 场景描述（如：高并发 API 服务、实时数据流处理）
+      fit_score:
+        range: integer
+        minimum_value: 1
+        required: false
+        description: 契合度评分（1~5，5=强烈推荐）
+      anti_pattern:
+        range: string
+        required: false
+        description: 反模式说明（什么情况下不适合使用）
+
+  # ---------------------------------------------------------------------------
+  # Integration：与其他技术的集成关系
+  # ---------------------------------------------------------------------------
+  Integration:
+    description: >
+      描述两项技术之间的集成关系。
+      例如 FastAPI + SQLAlchemy（USES），LangChain + OpenAI（USES）。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      target_technology:
+        range: Technology
+        required: true
+        description: 被集成的目标技术
+      direction:
+        range: IntegrationDirection
+        required: true
+        description: 集成方向
+      description:
+        range: string
+        required: false
+        x_index: true
+        description: 集成方式说明（如：通过 langchain-openai 包集成，支持流式输出）
+      maturity:
+        range: MaturityLevel
+        required: false
+        description: 该集成方案的成熟度
+
+  # ---------------------------------------------------------------------------
+  # Technology：技术实体（知识图谱核心节点）
+  # ---------------------------------------------------------------------------
+  Technology:
+    tree_root: true
+    description: >
+      技术实体，代表一个具体的开源项目、框架、语言或平台。
+      以特性（Feature）→ 使用场景（UseCase）→ 集成关系（Integration）→
+      学习资源（LearningResource）的层次结构完整建模技术选型所需的语义信息。
+    attributes:
+      id:
+        identifier: true
+        required: true
+      name:
+        range: string
+        required: true
+        x_index: true
+        description: 技术名称（如：FastAPI、PostgreSQL、LangChain）
+      layer:
+        range: TechLayer
+        required: true
+        description: 所属技术架构层
+      category:
+        range: TechCategory
+        required: false
+        description: 所属细分分类节点
+      version:
+        range: string
+        required: false
+        description: 当前稳定版本（如：v0.115.0）
+      maturity:
+        range: MaturityLevel
+        required: true
+        description: 技术成熟度
+      license:
+        range: LicenseType
+        required: false
+        description: 开源许可证
+      language:
+        range: string
+        required: false
+        description: 实现语言（如：Python、Go、TypeScript）
+      homepage:
+        range: string
+        required: false
+        description: 官方主页或 GitHub 仓库地址
+      summary:
+        range: string
+        required: true
+        x_index: true
+        description: 一句话技术简介（用于向量检索意图匹配）
+      description:
+        range: string
+        required: false
+        x_index: true
+        description: 详细描述，含设计哲学、核心定位和适用规模
+      tags:
+        range: string
+        multivalued: true
+        x_index: true
+        description: >
+          关键词标签列表（如：["async", "type-safe", "REST", "Python"]）。
+          用于向量检索时的多维度匹配。
+      learning_curve:
+        range: DifficultyLevel
+        required: false
+        description: 上手难度
+      # === Relations ===
+      features:
+        range: Feature
+        multivalued: true
+        description: 该技术的核心特性列表
+      use_cases:
+        range: UseCase
+        multivalued: true
+        description: 适用场景列表（包含反模式说明）
+      integrations:
+        range: Integration
+        multivalued: true
+        description: 与其他技术的集成关系列表
+      resources:
+        range: LearningResource
+        multivalued: true
+        description: 相关学习资源（文档、教程、书籍）

@@ -28,7 +28,7 @@ from langchain_elasticsearch.vectorstores import DistanceStrategy
 from langchain_openai import OpenAIEmbeddings
 
 from graph.models import GraphEdge, GraphNode, KnowledgeGraph
-from graph.schema_loader import FieldSpec, get_class_field_specs, get_relation_specs
+from graph.schema_loader import FieldSpec, get_class_field_specs, get_relation_specs, get_root_class
 from graph.utils import subgraph_to_mermaid
 
 load_dotenv()
@@ -48,8 +48,11 @@ _INDEX_MAX_CHARS: int = 300
 
 DEFAULT_GRAPH_PATH = "data/graph.json"
 
-# Root class for context traversal (env-override for generic deployments)
-ROOT_CLASS: str = os.getenv("ROOT_CLASS", "SOP")
+# Root class and its ancestry-id key derived from the schema at module load.
+_ROOT_CLASS: str = get_root_class(SCHEMA_PATH)
+# Key name stored in child node.data to reference their root ancestor,
+# e.g. "SOP" → "sop_id"
+_ROOT_ID_KEY: str = f"{_ROOT_CLASS.lower()}_id"
 
 
 def _field_to_output_key(field_name: str) -> str:
@@ -73,7 +76,7 @@ class SubgraphResult:
         Raw score-ordered vector-search results (multiple docs per node possible).
     start_node_ids : list[str]
         Deduplicated node IDs used as traversal entry points.  When
-        ``traverse_from_root=True`` these will be SOP root IDs; when
+        ``traverse_from_root=True`` these will be root entity IDs; when
         ``traverse_from_root=False`` they are the matched node IDs.
     subgraph : nx.DiGraph
         Merged connected subgraph of all traversal roots.  **Not JSON-serializable.**
@@ -153,12 +156,14 @@ class GraphStore:
     Attributes
     ----------
     nx_graph   : directed graph; nodes have 'node_type' + all data fields as attrs
-    vector_store : InMemoryVectorStore; each doc has metadata {node_id, node_type, sop_id}
+    vector_store : InMemoryVectorStore; each doc has metadata {node_id, node_type, root_id}
     node_map   : node_id → GraphNode (fast attribute lookup)
+    schema_path: LinkML YAML path used for this graph; empty = module-level default
     """
     nx_graph: nx.DiGraph = field(default_factory=nx.DiGraph)
     vector_store: Optional[VectorStore] = None
     node_map: dict[str, GraphNode] = field(default_factory=dict)
+    schema_path: str = ""
 
     # ------------------------------------------------------------------
     # Load / Save
@@ -175,15 +180,17 @@ class GraphStore:
             raw = json.load(f)
 
         kg = KnowledgeGraph.model_validate(raw)
-        store = cls()
+        # Restore the schema that was used to build this graph (persisted in JSON)
+        store = cls(schema_path=kg.schema_path or "")
         store._build_nx(kg)
         store._build_vector_index(kg)
         return store
 
     @classmethod
-    def from_kg(cls, kg: KnowledgeGraph) -> "GraphStore":
+    def from_kg(cls, kg: KnowledgeGraph, schema_path: Optional[str] = None) -> "GraphStore":
         """Build store directly from an in-memory KnowledgeGraph."""
-        store = cls()
+        effective_schema = schema_path or kg.schema_path or ""
+        store = cls(schema_path=effective_schema)
         store._build_nx(kg)
         store._build_vector_index(kg)
         return store
@@ -217,6 +224,10 @@ class GraphStore:
         Document per list item; scalar fields produce a single Document.
         No class names or field names are hardcoded here.
         """
+        _sp = self.schema_path or SCHEMA_PATH
+        _root_class = get_root_class(_sp)
+        _root_id_key = f"{_root_class.lower()}_id"
+
         embeddings = _create_embeddings()
         docs: list[Document] = []
 
@@ -227,20 +238,20 @@ class GraphStore:
             d = node.data
             ntype = node.node_type
 
-            # sop_id: use the data field when present (child nodes); for root
-            # nodes that own the SOP hierarchy, fall back to node.id.
-            sop_id: str = d.get("sop_id") or node.id
+            # root_id: use the ancestor-id field when present (child nodes);
+            # for root nodes that own the entity hierarchy, fall back to node.id.
+            root_id: str = d.get(_root_id_key) or node.id
 
             if ntype not in specs_cache:
                 try:
                     specs_cache[ntype] = [
-                        s for s in get_class_field_specs(SCHEMA_PATH, ntype)
+                        s for s in get_class_field_specs(_sp, ntype)
                         if s.indexed and s.range.lower() in _STRING_RANGES
                     ]
                 except Exception as exc:
                     logger.warning(
                         "[storage] could not load field specs for %s from %s: %s",
-                        ntype, SCHEMA_PATH, exc,
+                        ntype, _sp, exc,
                     )
                     specs_cache[ntype] = []
 
@@ -249,11 +260,11 @@ class GraphStore:
                 continue
 
             def _meta(node_id: str = node.id, node_type: str = ntype,
-                      _sop_id: str = sop_id, _data: dict = d) -> dict[str, Any]:
+                      _root_id: str = root_id, _data: dict = d) -> dict[str, Any]:
                 return {
                     "node_id": node_id,
                     "node_type": node_type,
-                    "sop_id": _sop_id,
+                    "root_id": _root_id,
                     "schema": _data,
                 }
 
@@ -292,7 +303,7 @@ class GraphStore:
             )
             for u, v, data in self.nx_graph.edges(data=True)
         ]
-        return KnowledgeGraph(nodes=nodes, edges=edges)
+        return KnowledgeGraph(nodes=nodes, edges=edges, schema_path=self.schema_path or None)
 
     # ------------------------------------------------------------------
     # Query helpers
@@ -304,7 +315,7 @@ class GraphStore:
         """
         Return top-k semantically similar nodes.
 
-        Returns list of dicts: {node_id, node_type, sop_id, score, text}
+        Returns list of dicts: {node_id, node_type, root_id, score, text}
         """
         if self.vector_store is None:
             return []
@@ -314,7 +325,7 @@ class GraphStore:
             hits.append({
                 "node_id": doc.metadata["node_id"],
                 "node_type": doc.metadata["node_type"],
-                "sop_id": doc.metadata.get("sop_id", ""),
+                "root_id": doc.metadata.get("root_id", ""),
                 "score": float(score),
                 "text": doc.page_content,
             })
@@ -328,7 +339,7 @@ class GraphStore:
         return {"id": node.id, "node_type": node.node_type, **node.data}
 
     def get_ancestors(self, node_id: str) -> list[dict[str, Any]]:
-        """Walk edges in reverse to collect [SOP → Step → Rule] chain."""
+        """Walk edges in reverse to collect ancestor chain."""
         ancestors = []
         current = node_id
         visited = set()
@@ -346,7 +357,7 @@ class GraphStore:
             current = parent
         return ancestors
 
-    def get_sop_context(self, sop_id: str) -> dict[str, Any]:
+    def get_root_context(self, root_id: str) -> dict[str, Any]:
         """Return the full root-node tree sorted by index fields (schema-driven).
 
         Output structure mirrors the schema relation hierarchy:
@@ -365,15 +376,15 @@ class GraphStore:
           ]
         }
         """
-        root_node = self.get_node(sop_id)
+        root_node = self.get_node(root_id)
         if not root_node:
             return {}
 
-        result: dict[str, Any] = {ROOT_CLASS.lower(): root_node}
-        root_rel_specs = get_relation_specs(SCHEMA_PATH, ROOT_CLASS)
+        result: dict[str, Any] = {_ROOT_CLASS.lower(): root_node}
+        root_rel_specs = get_relation_specs(SCHEMA_PATH, _ROOT_CLASS)
         for spec in root_rel_specs:
             output_key = _field_to_output_key(spec.field_name)
-            result[output_key] = self._build_relation_list(sop_id, ROOT_CLASS, spec)
+            result[output_key] = self._build_relation_list(root_id, _ROOT_CLASS, spec)
 
         return result
 
@@ -499,8 +510,8 @@ class GraphStore:
     def _find_root(self, node_id: str) -> str:
         """Walk upward through predecessors to find the topmost ancestor node.
 
-        Used only as a fallback when a hit has no ``sop_id`` (e.g. Tool nodes).
-        Prefer resolving via ``sop_id`` for SOP-hierarchy nodes.
+        Used only as a fallback when a hit has no ``root_id`` (e.g. Tool nodes).
+        Prefer resolving via ``root_id`` for hierarchy nodes.
         """
         ancestors = self.get_ancestors(node_id)
         return ancestors[0]["id"] if ancestors else node_id
@@ -524,8 +535,8 @@ class GraphStore:
             Note: the vector index stores multiple docs per node (one per indexed
             text field), so the actual number of unique nodes may be lower than k.
         traverse_from_root : bool
-            If ``True``, resolve each hit's root SOP node (via the indexed
-            ``sop_id``) and traverse the **full SOP subtree** from there.
+            If ``True``, resolve each hit's root entity node (via the indexed
+            ``root_id``) and traverse the **full entity subtree** from there.
             If ``False`` (default), traverse the subgraph downward from the
             matched node itself for a focused result.
 
@@ -557,14 +568,14 @@ class GraphStore:
         deduped_hits = list(seen_hits.values())
 
         # Determine traversal entry point for each unique matched node.
-        # When traverse_from_root=True, use the indexed sop_id as the canonical
+        # When traverse_from_root=True, use the indexed root_id as the canonical
         # root — this avoids ambiguous predecessor walks on multi-parent nodes.
         start_ids: list[str] = []
         seen_starts: set[str] = set()
         for hit in deduped_hits:
             if traverse_from_root:
-                sop_id = hit.get("sop_id", "")
-                start = sop_id if sop_id and sop_id in self.nx_graph else self._find_root(hit["node_id"])
+                root_id = hit.get("root_id", "")
+                start = root_id if root_id and root_id in self.nx_graph else self._find_root(hit["node_id"])
             else:
                 start = hit["node_id"]
             if start not in seen_starts:

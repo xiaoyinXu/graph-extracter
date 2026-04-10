@@ -117,7 +117,7 @@ class ExtractionOutput(BaseModel):
 class GraphNode(BaseModel):
     """知识图谱中的节点"""
     id: str
-    node_type: str  # SOP | SOPStep | SOPRule | SOPSubRule | Tool
+    node_type: str  # class name from schema, e.g. SOP | SOPStep | SOPRule | Tool
     data: dict      # serialized entity fields
 
 
@@ -125,11 +125,15 @@ class GraphEdge(BaseModel):
     """知识图谱中的有向边"""
     source: str
     target: str
-    edge_type: str  # HAS_STEP | HAS_RULE | HAS_SUB_RULE | USES_TOOL | NEXT_STEP
-    metadata: dict = Field(default_factory=dict)  # e.g. {"when": "REJECTED"}
+    edge_type: str  # derived from schema relation, e.g. HAS_STEP | USES_TOOL | NEXT_STEP
+    metadata: dict = Field(default_factory=dict)
 
 
 class KnowledgeGraph(BaseModel):
     """可序列化的完整知识图谱"""
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
+    schema_path: Optional[str] = Field(
+        default=None,
+        description="LinkML schema YAML path used to build this graph (persisted for reload)"
+    )
