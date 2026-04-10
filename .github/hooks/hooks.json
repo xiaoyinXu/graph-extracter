@@ -4,7 +4,7 @@
     "sessionStart": [
       {
         "type": "command",
-        "bash": "echo \"1\" >> 1.log",
+        "bash": "echo \"Session started: $(date)\" >> logs/session.log",
         "cwd": ".",
         "timeoutSec": 10
       }
